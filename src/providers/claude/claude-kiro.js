@@ -20,6 +20,735 @@ const KIRO_THINKING = {
     MAX_LEN_TAG: '<max_thinking_length>',
 };
 
+// 缓存推测配置
+const CACHE_ESTIMATION_CONFIG = {
+    CACHE_TTL: 300000,              // 5分钟 TTL（与 Claude 官方一致）
+    MIN_CACHEABLE_TOKENS: 1024,     // 最小可缓存 token 数
+    MAX_CACHE_SIZE: 500,            // LRU 缓存最大条目数
+    ENABLED: true,                  // 是否启用缓存推测
+};
+
+/**
+ * 简单的 LRU 缓存实现
+ */
+class SimpleLRUCache {
+    constructor(maxSize = 500, ttl = 300000) {
+        this.maxSize = maxSize;
+        this.ttl = ttl;
+        this.cache = new Map();
+    }
+
+    get(key) {
+        const item = this.cache.get(key);
+        if (!item) return null;
+
+        // 检查是否过期
+        if (Date.now() - item.timestamp > this.ttl) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        // LRU: 移到末尾
+        this.cache.delete(key);
+        this.cache.set(key, item);
+        return item;
+    }
+
+    set(key, value) {
+        // 如果已存在，先删除
+        if (this.cache.has(key)) {
+            this.cache.delete(key);
+        }
+
+        // 检查容量
+        if (this.cache.size >= this.maxSize) {
+            // 删除最旧的条目
+            const firstKey = this.cache.keys().next().value;
+            this.cache.delete(firstKey);
+        }
+
+        this.cache.set(key, {
+            ...value,
+            timestamp: Date.now()
+        });
+    }
+
+    has(key) {
+        return this.get(key) !== null;
+    }
+
+    get size() {
+        return this.cache.size;
+    }
+
+    clear() {
+        this.cache.clear();
+    }
+}
+
+/**
+ * Kiro 缓存推测器
+ * 用于推测 Prompt Caching 的缓存命中情况
+ *
+ * 设计原则：
+ * 1. 基于前缀匹配：Claude 缓存是前缀匹配，相同的 system+tools 应该命中缓存
+ * 2. 区分静态前缀和动态消息：只对静态前缀计算哈希
+ * 3. 支持消息中的缓存断点：遇到 cache_control 时，缓存前缀在该消息之前截止
+ */
+class KiroCacheEstimator {
+    constructor(config = {}) {
+        this.config = {
+            cacheTTL: config.cacheTTL || CACHE_ESTIMATION_CONFIG.CACHE_TTL,
+            minCacheableTokens: config.minCacheableTokens || CACHE_ESTIMATION_CONFIG.MIN_CACHEABLE_TOKENS,
+            maxCacheSize: config.maxCacheSize || CACHE_ESTIMATION_CONFIG.MAX_CACHE_SIZE,
+            enabled: config.enabled !== false && CACHE_ESTIMATION_CONFIG.ENABLED
+        };
+
+        // 请求缓存记录
+        this.requestCache = new SimpleLRUCache(
+            this.config.maxCacheSize,
+            this.config.cacheTTL
+        );
+
+        // 统计信息
+        this.stats = {
+            totalRequests: 0,
+            estimatedCacheHits: 0,
+            estimatedCacheCreations: 0,
+            belowThreshold: 0
+        };
+    }
+
+    /**
+     * 主入口：估算缓存 token
+     * @param {Object} request - 原始请求
+     * @param {number} totalInputTokens - 总输入 token 数（包含所有内容）
+     * @param {string} model - 模型名称
+     * @returns {Object} { cache_read_input_tokens, cache_creation_input_tokens, uncached_input_tokens, _estimation }
+     *
+     * Claude API 计费公式：
+     * total_input = cache_read_input_tokens + cache_creation_input_tokens + uncached_input_tokens
+     * - cache_read: 从缓存读取的 token (0.1x 价格)
+     * - cache_creation: 写入缓存的 token (1.25x 价格)
+     * - uncached_input: 不参与缓存的普通 token (1x 价格)
+     */
+    estimateCacheTokens(request, totalInputTokens, model) {
+        if (!this.config.enabled) {
+            return {
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                uncached_input_tokens: totalInputTokens,
+                _estimation: { estimated: false, source: 'disabled' }
+            };
+        }
+
+        this.stats.totalRequests++;
+
+        // 1. 提取可缓存内容（区分静态前缀和缓存消息，每个消息带独立哈希）
+        const cacheableContent = this.extractCacheableContent(request);
+
+        // 2. 计算静态前缀的 token 数（system + tools）
+        const staticPrefixTokens = this.countStaticPrefixTokens(cacheableContent);
+
+        // 3. 获取从头到 lastCacheBreakpoint 的所有消息 tokens
+        // Claude 缓存是前缀匹配的，会缓存到第一个 cache_control 之前的所有内容
+        const prefixMessagesTokens = cacheableContent.prefixMessagesTokens;
+
+        // 4. 检查 system 是否有 cache_control
+        const systemHasCacheControl = cacheableContent.staticPrefix.systemHasCacheControl;
+
+        // 5. 总可缓存 token = 静态前缀 + 从头到断点的所有消息
+        // 如果 system 有 cache_control 但没有消息断点，静态前缀本身也可以被缓存
+        const totalCacheableTokens = systemHasCacheControl && prefixMessagesTokens === 0
+            ? staticPrefixTokens
+            : staticPrefixTokens + prefixMessagesTokens;
+
+        // 6. 计算不参与缓存的 token（断点之后的消息）
+        // uncached = total - cacheable
+        const uncachedTokens = Math.max(0, totalInputTokens - totalCacheableTokens);
+
+        // 7. 检查是否满足最小缓存条件
+        // 如果 system 有 cache_control，静态前缀本身就可以被缓存
+        if (totalCacheableTokens < this.config.minCacheableTokens) {
+            this.stats.belowThreshold++;
+            return {
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                uncached_input_tokens: totalInputTokens,  // 全部作为普通输入
+                _estimation: {
+                    estimated: true,
+                    source: 'below_threshold',
+                    confidence: 0.95,
+                    staticPrefixTokens,
+                    prefixMessagesTokens,
+                    totalCacheableTokens,
+                    uncachedTokens,
+                    totalInputTokens,
+                    systemHasCacheControl,
+                    lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
+                    minRequired: this.config.minCacheableTokens
+                }
+            };
+        }
+
+        // 8. 计算静态前缀哈希（system + tools，不包含消息断点位置）
+        const prefixHash = this.computeContentHash(cacheableContent, model);
+
+        // 9. 检查静态前缀是否命中
+        const cachedPrefix = this.requestCache.get(prefixHash);
+
+        if (cachedPrefix) {
+            // 静态前缀命中，逐个比较缓存前缀内的消息
+            const matchDetails = [];
+            const previousMessages = cachedPrefix.cachedMessages || [];
+            const currentMessages = cacheableContent.cachedMessages;
+            const allMessagesTokens = cacheableContent.allMessagesTokens;
+            const lastCacheBreakpoint = cacheableContent.lastCacheBreakpoint;
+
+            // Claude 缓存是严格前缀匹配，一旦某个位置断开，后续全部无法命中
+            let prefixBroken = false;
+            let lastMatchedBreakpoint = -1;  // 最后一个匹配的消息索引
+
+            // 逐个检查缓存前缀内的每个消息
+            for (let i = 0; i < currentMessages.length; i++) {
+                const currentMsg = currentMessages[i];
+                const previousMsg = previousMessages[i];
+
+                if (!prefixBroken &&
+                    previousMsg &&
+                    previousMsg.index === currentMsg.index &&
+                    previousMsg.contentHash === currentMsg.contentHash) {
+                    // 内容完全匹配且前缀未断
+                    lastMatchedBreakpoint = currentMsg.index;
+                    matchDetails.push({ index: currentMsg.index, status: 'hit', tokens: currentMsg.tokens });
+                } else {
+                    // 前缀断开，当前及后续全部是 cache_creation
+                    prefixBroken = true;
+                    matchDetails.push({
+                        index: currentMsg.index,
+                        status: previousMsg ? 'changed' : 'new',
+                        tokens: currentMsg.tokens
+                    });
+                }
+            }
+
+            // 计算 cache_read 和 cache_creation
+            let cacheRead = staticPrefixTokens;
+            let cacheCreation = 0;
+
+            if (currentMessages.length === 0) {
+                // 没有缓存前缀消息（lastCacheBreakpoint < 0），只有静态前缀
+                // 静态前缀命中，全部作为 cache_read
+                cacheCreation = 0;
+            } else if (!prefixBroken) {
+                // 所有消息都匹配，全部作为 cache_read
+                for (let i = 0; i <= lastCacheBreakpoint; i++) {
+                    cacheRead += allMessagesTokens[i];
+                }
+                cacheCreation = 0;
+            } else {
+                // 部分匹配
+                if (lastMatchedBreakpoint >= 0) {
+                    for (let i = 0; i <= lastMatchedBreakpoint; i++) {
+                        cacheRead += allMessagesTokens[i];
+                    }
+                }
+                // 从 lastMatchedBreakpoint+1 到 lastCacheBreakpoint 的消息作为 cache_creation
+                for (let i = lastMatchedBreakpoint + 1; i <= lastCacheBreakpoint; i++) {
+                    cacheCreation += allMessagesTokens[i];
+                }
+            }
+
+            // 更新缓存记录
+            this.requestCache.set(prefixHash, {
+                staticPrefixTokens,
+                prefixMessagesTokens,
+                lastCacheBreakpoint,
+                cachedMessages: currentMessages.map(m => ({
+                    index: m.index,
+                    contentHash: m.contentHash,
+                    tokens: m.tokens
+                })),
+                allMessagesTokens: [...allMessagesTokens],
+                hitCount: (cachedPrefix.hitCount || 0) + 1
+            });
+
+            const hasNewOrChanged = cacheCreation > 0;
+            const source = hasNewOrChanged ? 'cache_hit_partial' : 'cache_hit';
+            this.stats.estimatedCacheHits++;
+
+            return {
+                cache_read_input_tokens: cacheRead,
+                cache_creation_input_tokens: cacheCreation,
+                uncached_input_tokens: uncachedTokens,
+                _estimation: {
+                    estimated: true,
+                    source,
+                    confidence: 0.85,
+                    staticPrefixTokens,
+                    prefixMessagesTokens,
+                    totalCacheableTokens,
+                    uncachedTokens,
+                    totalInputTokens,
+                    systemHasCacheControl,
+                    lastCacheBreakpoint,
+                    lastMatchedBreakpoint,
+                    hitCount: cachedPrefix.hitCount + 1,
+                    matchDetails,
+                    contentHash: prefixHash
+                }
+            };
+        } else {
+            // 静态前缀未命中，全部作为缓存创建
+            this.stats.estimatedCacheCreations++;
+
+            // 存储每个消息的独立信息
+            this.requestCache.set(prefixHash, {
+                staticPrefixTokens,
+                prefixMessagesTokens,
+                lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
+                cachedMessages: cacheableContent.cachedMessages.map(m => ({
+                    index: m.index,
+                    contentHash: m.contentHash,
+                    tokens: m.tokens
+                })),
+                allMessagesTokens: [...cacheableContent.allMessagesTokens],
+                hitCount: 0
+            });
+
+            return {
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: totalCacheableTokens,
+                uncached_input_tokens: uncachedTokens,
+                _estimation: {
+                    estimated: true,
+                    source: 'cache_creation',
+                    confidence: 0.90,
+                    staticPrefixTokens,
+                    prefixMessagesTokens,
+                    totalCacheableTokens,
+                    uncachedTokens,
+                    totalInputTokens,
+                    systemHasCacheControl,
+                    lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
+                    contentHash: prefixHash
+                }
+            };
+        }
+    }
+
+    /**
+     * 提取可缓存内容
+     * 区分静态前缀（system + tools）和带缓存断点的消息
+     * 为每个缓存消息计算独立的哈希和 token 数
+     *
+     * 缓存推测策略：
+     * - system 和 tools 始终参与缓存推测（即使没有 cache_control）
+     * - Claude 缓存是前缀匹配的，会缓存从头到第一个 cache_control 之前的所有内容
+     * - 如果没有 cache_control，则所有消息都参与缓存前缀
+     */
+    extractCacheableContent(request) {
+        const cacheable = {
+            // 静态前缀（用于判断缓存命中）
+            staticPrefix: {
+                system: null,
+                systemHasCacheControl: false,
+                tools: null
+            },
+            // 缓存前缀内的消息（用于哈希比较，检测内容变化）
+            cachedMessages: [],
+            // 缓存前缀的最后一个消息索引（遇到 cache_control 则在其前一条截止，否则为最后一条）
+            lastCacheBreakpoint: -1,
+            // 从头到 lastCacheBreakpoint 的所有消息 tokens
+            prefixMessagesTokens: 0,
+            // 每个消息的 token 数（用于精确计算 cache_read/cache_creation）
+            allMessagesTokens: []
+        };
+
+        // 1. System prompt - 始终参与缓存推测（即使没有 cache_control）
+        if (request.system) {
+            cacheable.staticPrefix.system = request.system;
+            // 检查是否有显式的 cache_control
+            if (Array.isArray(request.system)) {
+                cacheable.staticPrefix.systemHasCacheControl = request.system.some(p => p && p.cache_control);
+            } else if (typeof request.system === 'object' && request.system !== null && request.system.cache_control) {
+                cacheable.staticPrefix.systemHasCacheControl = true;
+            }
+        }
+
+        // 2. Tools 定义 - 始终参与缓存推测
+        if (request.tools && request.tools.length > 0) {
+            cacheable.staticPrefix.tools = request.tools;
+        }
+
+        // 3. 遍历 messages，计算每个消息的 tokens，找到第一个 cache_control 的位置
+        if (request.messages && request.messages.length > 0) {
+            // 查找第一个带 cache_control 的消息索引
+            let cacheControlIndex = -1;
+            for (let i = 0; i < request.messages.length; i++) {
+                const msg = request.messages[i];
+                if (this.messageHasCacheControl(msg)) {
+                    cacheControlIndex = i;
+                    break;
+                }
+            }
+
+            // 计算每个消息的 token 数
+            for (let i = 0; i < request.messages.length; i++) {
+                const msg = request.messages[i];
+                const contentText = this.contentToText(msg.content, msg.role);
+                const msgTokens = this.countTokensSimple(contentText);
+                cacheable.allMessagesTokens.push(msgTokens);
+            }
+
+            // 确定缓存前缀的范围
+            if (cacheControlIndex !== -1) {
+                // 有 cache_control：缓存到 cache_control 之前的所有消息
+                cacheable.lastCacheBreakpoint = cacheControlIndex - 1;
+            } else {
+                // 没有 cache_control：所有消息都参与缓存前缀
+                cacheable.lastCacheBreakpoint = request.messages.length - 1;
+            }
+
+            // 为缓存前缀内的每个消息计算哈希
+            if (cacheable.lastCacheBreakpoint >= 0) {
+                for (let i = 0; i <= cacheable.lastCacheBreakpoint; i++) {
+                    const msg = request.messages[i];
+                    cacheable.cachedMessages.push({
+                        index: i,
+                        role: msg.role,
+                        // 使用稳定字段计算哈希，排除易变的 tool_use_id/id/input
+                        contentHash: this.simpleHash(this.contentToTextForHash(msg.content, msg.role)),
+                        tokens: cacheable.allMessagesTokens[i]
+                    });
+                    cacheable.prefixMessagesTokens += cacheable.allMessagesTokens[i];
+                }
+            }
+        }
+
+        return cacheable;
+    }
+
+    /**
+     * 检查消息是否包含 cache_control
+     * 支持数组格式、对象格式和消息级 cache_control
+     */
+    messageHasCacheControl(msg) {
+        if (!msg) return false;
+
+        // 检查消息级 cache_control
+        if (msg.cache_control) return true;
+
+        // 检查 content 数组中的 cache_control
+        if (Array.isArray(msg.content)) {
+            return msg.content.some(p => p && p.cache_control);
+        }
+
+        // 检查 content 对象的 cache_control
+        if (typeof msg.content === 'object' && msg.content !== null && msg.content.cache_control) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 计算静态前缀的 token 数
+     * system 和 tools 始终计入（即使没有 cache_control）
+     */
+    countStaticPrefixTokens(cacheableContent) {
+        let tokens = 0;
+
+        // system 始终计入缓存推测
+        if (cacheableContent.staticPrefix.system) {
+            const systemText = this.contentToText(cacheableContent.staticPrefix.system);
+            tokens += this.countTokensSimple(systemText);
+        }
+
+        // tools 始终计入缓存推测
+        if (cacheableContent.staticPrefix.tools) {
+            tokens += this.countTokensSimple(JSON.stringify(cacheableContent.staticPrefix.tools));
+        }
+
+        return tokens;
+    }
+
+    /**
+     * 计算内容哈希（只包含静态前缀：system + tools）
+     * 使用稳定字段，排除动态内容
+     */
+    computeContentHash(cacheableContent, model) {
+        // 对 system 和 tools 使用稳定字段提取
+        const stableSystem = this.extractStableFields(cacheableContent.staticPrefix.system);
+        const stableTools = this.extractStableToolsFields(cacheableContent.staticPrefix.tools);
+
+        const hashInput = JSON.stringify({
+            model: model,
+            system: stableSystem,
+            tools: stableTools
+        });
+
+        return this.simpleHash(hashInput);
+    }
+
+    /**
+     * 提取稳定字段（用于哈希计算）
+     * 排除可能包含动态内容的字段
+     */
+    extractStableFields(content) {
+        if (!content) return null;
+        if (typeof content === 'string') return content;
+
+        if (Array.isArray(content)) {
+            return content.map(c => {
+                if (typeof c === 'string') return c;
+                if (typeof c === 'object' && c !== null) {
+                    // 只保留稳定字段
+                    const stable = {};
+                    if (c.type) stable.type = c.type;
+                    if (c.text) stable.text = c.text;
+                    if (c.cache_control) stable.cache_control = c.cache_control;
+                    return stable;
+                }
+                return c;
+            });
+        }
+
+        if (typeof content === 'object') {
+            const stable = {};
+            if (content.type) stable.type = content.type;
+            if (content.text) stable.text = content.text;
+            if (content.cache_control) stable.cache_control = content.cache_control;
+            return stable;
+        }
+
+        return content;
+    }
+
+    /**
+     * 提取工具定义的稳定字段
+     * 工具定义通常是稳定的，但排除可能的动态字段
+     */
+    extractStableToolsFields(tools) {
+        if (!tools || !Array.isArray(tools)) return null;
+
+        return tools.map(tool => {
+            if (typeof tool !== 'object' || tool === null) return tool;
+            // 工具定义的核心字段：name, description, input_schema
+            const stable = {};
+            if (tool.name) stable.name = tool.name;
+            if (tool.description) stable.description = tool.description;
+            if (tool.input_schema) stable.input_schema = tool.input_schema;
+            return stable;
+        });
+    }
+
+    /**
+     * 内容转文本（包含元数据用于哈希计算和 token 估算）
+     * @param {any} content - 消息内容
+     * @param {string} role - 消息角色（可选）
+     */
+    contentToText(content, role = null) {
+        let parts = [];
+        if (role) parts.push(role);
+
+        if (!content) return parts.join(' ');
+        if (typeof content === 'string') {
+            parts.push(content);
+            return parts.join(' ');
+        }
+
+        if (Array.isArray(content)) {
+            for (const c of content) {
+                if (typeof c === 'string') {
+                    parts.push(c);
+                    continue;
+                }
+                // 包含元数据：type, cache_control, tool_use_id, name, id 等
+                if (c.type) parts.push(c.type);
+                if (c.cache_control) parts.push(JSON.stringify(c.cache_control));
+                if (c.text) parts.push(c.text);
+                if (c.thinking) parts.push(c.thinking);
+                if (c.tool_use_id) parts.push(c.tool_use_id);
+                if (c.name) parts.push(c.name);
+                if (c.id) parts.push(c.id);
+                if (c.input) parts.push(JSON.stringify(c.input));
+                if (c.content) parts.push(this.contentToText(c.content));
+            }
+            return parts.join(' ');
+        }
+
+        parts.push(JSON.stringify(content));
+        return parts.join(' ');
+    }
+
+    /**
+     * 内容转文本（仅稳定字段，用于哈希计算）
+     * 排除易变字段：tool_use_id, id, input
+     * @param {any} content - 消息内容
+     * @param {string} role - 消息角色（可选）
+     */
+    contentToTextForHash(content, role = null) {
+        let parts = [];
+        if (role) parts.push(role);
+
+        if (!content) return parts.join(' ');
+        if (typeof content === 'string') {
+            parts.push(content);
+            return parts.join(' ');
+        }
+
+        if (Array.isArray(content)) {
+            for (const c of content) {
+                if (typeof c === 'string') {
+                    parts.push(c);
+                    continue;
+                }
+                // 只包含稳定字段
+                if (c.type) parts.push(c.type);
+                if (c.cache_control) parts.push(JSON.stringify(c.cache_control));
+                if (c.text) parts.push(c.text);
+                if (c.thinking) parts.push(c.thinking);
+                if (c.name) parts.push(c.name);  // 工具名是稳定的
+                // 排除: tool_use_id, id, input（这些每次请求都可能变化）
+                if (c.content) parts.push(this.contentToTextForHash(c.content));
+            }
+            return parts.join(' ');
+        }
+
+        // 对于非数组对象，只提取稳定字段
+        if (typeof content === 'object') {
+            let parts2 = [];
+            if (content.type) parts2.push(content.type);
+            if (content.text) parts2.push(content.text);
+            if (content.name) parts2.push(content.name);
+            return parts.concat(parts2).join(' ');
+        }
+
+        return parts.join(' ');
+    }
+
+    /**
+     * Token 计数（使用官方 tokenizer，fallback 到字符估算）
+     */
+    countTokensSimple(text) {
+        if (!text) return 0;
+        try {
+            return countTokens(text);
+        } catch (e) {
+            // tokenizer 失败时 fallback
+            return Math.ceil(text.length / 4);
+        }
+    }
+
+    /**
+     * 安全哈希函数（使用 MD5，碰撞概率极低）
+     */
+    simpleHash(str) {
+        return crypto.createHash('md5').update(str, 'utf8').digest('hex');
+    }
+
+    /**
+     * 获取统计信息
+     */
+    getStats() {
+        return {
+            ...this.stats,
+            cacheSize: this.requestCache.size,
+            config: this.config
+        };
+    }
+
+    /**
+     * 清空缓存
+     */
+    clearCache() {
+        this.requestCache.clear();
+        console.log('[Kiro CacheEstimator] Cache cleared');
+    }
+}
+
+// 按账号隔离的缓存推测器实例 Map<accountId, { estimator, lastUsed }>
+const accountCacheEstimators = new Map();
+
+// 账号缓存推测器的配置
+const ACCOUNT_CACHE_CONFIG = {
+    MAX_ACCOUNTS: 100,           // 最多缓存多少个账号的推测器
+    ACCOUNT_TTL: 3600000,        // 账号推测器的过期时间（1小时）
+    CLEANUP_INTERVAL: 300000     // 清理间隔（5分钟）
+};
+
+let lastCleanupTime = Date.now();
+
+/**
+ * 清理过期的账号缓存推测器
+ */
+function cleanupExpiredAccountEstimators() {
+    const now = Date.now();
+
+    // 检查是否需要清理
+    if (now - lastCleanupTime < ACCOUNT_CACHE_CONFIG.CLEANUP_INTERVAL) {
+        return;
+    }
+    lastCleanupTime = now;
+
+    let cleanedCount = 0;
+    for (const [accountId, entry] of accountCacheEstimators.entries()) {
+        if (now - entry.lastUsed > ACCOUNT_CACHE_CONFIG.ACCOUNT_TTL) {
+            accountCacheEstimators.delete(accountId);
+            cleanedCount++;
+        }
+    }
+
+    // 如果超过最大数量，删除最久未使用的
+    if (accountCacheEstimators.size > ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS) {
+        const sortedEntries = [...accountCacheEstimators.entries()]
+            .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+
+        const toDelete = sortedEntries.slice(0, accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS);
+        for (const [accountId] of toDelete) {
+            accountCacheEstimators.delete(accountId);
+            cleanedCount++;
+        }
+    }
+
+    if (cleanedCount > 0) {
+        console.log(`[Kiro CacheEstimator] Cleaned up ${cleanedCount} expired account estimators, remaining: ${accountCacheEstimators.size}`);
+    }
+}
+
+/**
+ * 获取或创建指定账号的缓存推测器
+ * @param {string} accountId - 账号唯一标识（uuid）
+ * @param {Object} config - 配置选项
+ * @returns {KiroCacheEstimator} 该账号的缓存推测器
+ */
+function getCacheEstimatorForAccount(accountId, config = {}) {
+    // 先清理过期的推测器
+    cleanupExpiredAccountEstimators();
+
+    // 如果没有提供 accountId，使用默认标识
+    const effectiveAccountId = accountId || 'default';
+
+    let entry = accountCacheEstimators.get(effectiveAccountId);
+
+    if (!entry) {
+        // 创建新的推测器
+        const estimator = new KiroCacheEstimator(config);
+        entry = {
+            estimator,
+            lastUsed: Date.now()
+        };
+        accountCacheEstimators.set(effectiveAccountId, entry);
+        console.log(`[Kiro] Cache estimator created for account: ${effectiveAccountId} (total accounts: ${accountCacheEstimators.size})`);
+    } else {
+        // 更新最后使用时间
+        entry.lastUsed = Date.now();
+    }
+
+    return entry.estimator;
+}
+
 const KIRO_CONSTANTS = {
     REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
     REFRESH_IDC_URL: 'https://oidc.{{region}}.amazonaws.com/token',
@@ -1731,7 +2460,20 @@ async initializeAuth(forceRefresh = false) {
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
 
+            // 使用按账号隔离的缓存推测器估算缓存 token
+            const cacheEstimator = getCacheEstimatorForAccount(this.uuid);
+            const cacheEstimation = cacheEstimator.estimateCacheTokens(requestBody, estimatedInputTokens, model);
+
+            if (cacheEstimation._estimation?.estimated) {
+                console.log(`[Kiro] Cache estimation: source=${cacheEstimation._estimation.source}, ` +
+                    `cache_read=${cacheEstimation.cache_read_input_tokens}, ` +
+                    `cache_creation=${cacheEstimation.cache_creation_input_tokens}, ` +
+                    `uncached=${cacheEstimation.uncached_input_tokens}, ` +
+                    `confidence=${cacheEstimation._estimation.confidence}`);
+            }
+
             // 1. 先发送 message_start 事件
+            // input_tokens 应该是 uncached_input_tokens（不参与缓存的普通输入）
             yield {
                 type: "message_start",
                 message: {
@@ -1740,10 +2482,10 @@ async initializeAuth(forceRefresh = false) {
                     role: "assistant",
                     model: model,
                     usage: {
-                        input_tokens: estimatedInputTokens,
+                        input_tokens: cacheEstimation.uncached_input_tokens,
                         output_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
+                        cache_creation_input_tokens: cacheEstimation.cache_creation_input_tokens,
+                        cache_read_input_tokens: cacheEstimation.cache_read_input_tokens
                     },
                     content: []
                 }
@@ -1971,28 +2713,20 @@ async initializeAuth(forceRefresh = false) {
                 outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
             }
 
-            // 计算 input tokens
-            // contextUsagePercentage 是包含输入和输出的总使用量百分比
-            // 总 token = TOTAL_CONTEXT_TOKENS * contextUsagePercentage / 100
-            // input token = 总 token - output token
-            if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
-                const totalTokens = Math.round(KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS * contextUsagePercentage / 100);
-                inputTokens = Math.max(0, totalTokens - outputTokens);
-                console.log(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
-            } else {
-                console.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
-                inputTokens = estimatedInputTokens;
-            }
+            // 最终的 input_tokens 使用 uncached_input_tokens
+            // Claude API 计费公式: total = cache_read + cache_creation + uncached
+            // input_tokens 字段应该只包含 uncached 部分
+            const finalInputTokens = cacheEstimation.uncached_input_tokens;
 
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : "end_turn" },
                 usage: {
-                    input_tokens: inputTokens,
+                    input_tokens: finalInputTokens,
                     output_tokens: outputTokens,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0
+                    cache_creation_input_tokens: cacheEstimation.cache_creation_input_tokens,
+                    cache_read_input_tokens: cacheEstimation.cache_read_input_tokens
                 }
             };
 
@@ -2021,38 +2755,75 @@ async initializeAuth(forceRefresh = false) {
 
     /**
      * Calculate input tokens from request body using Claude's official tokenizer
+     * Includes metadata tokens (role, type, cache_control, tool name/id, etc.)
      */
     estimateInputTokens(requestBody) {
         let totalTokens = 0;
-        
+
         // Count system prompt tokens
         if (requestBody.system) {
             const systemText = this.getContentText(requestBody.system);
             totalTokens += this.countTextTokens(systemText);
+            // Count cache_control in system if present
+            if (Array.isArray(requestBody.system)) {
+                for (const part of requestBody.system) {
+                    if (part.cache_control) {
+                        totalTokens += this.countTextTokens(JSON.stringify(part.cache_control));
+                    }
+                }
+            }
         }
-        
+
         // Count thinking prefix tokens if thinking is enabled
         if (requestBody.thinking?.type === 'enabled') {
             const budget = this._normalizeThinkingBudgetTokens(requestBody.thinking.budget_tokens);
             const prefixText = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
             totalTokens += this.countTextTokens(prefixText);
         }
-        
+
         // Count all messages tokens
         if (requestBody.messages && Array.isArray(requestBody.messages)) {
             for (const message of requestBody.messages) {
+                // Count role field tokens
+                if (message.role) {
+                    totalTokens += this.countTextTokens(message.role);
+                }
+
                 if (message.content) {
                     if (Array.isArray(message.content)) {
                         for (const part of message.content) {
+                            // Count type field tokens
+                            if (part.type) {
+                                totalTokens += this.countTextTokens(part.type);
+                            }
+
+                            // Count cache_control tokens
+                            if (part.cache_control) {
+                                totalTokens += this.countTextTokens(JSON.stringify(part.cache_control));
+                            }
+
                             if (part.type === 'text' && part.text) {
                                 totalTokens += this.countTextTokens(part.text);
                             } else if (part.type === 'thinking' && part.thinking) {
                                 totalTokens += this.countTextTokens(part.thinking);
                             } else if (part.type === 'tool_result') {
+                                // Count tool_use_id tokens
+                                if (part.tool_use_id) {
+                                    totalTokens += this.countTextTokens(part.tool_use_id);
+                                }
                                 const resultContent = this.getContentText(part.content);
                                 totalTokens += this.countTextTokens(resultContent);
-                            } else if (part.type === 'tool_use' && part.input) {
-                                totalTokens += this.countTextTokens(JSON.stringify(part.input));
+                            } else if (part.type === 'tool_use') {
+                                // Count tool name and id tokens
+                                if (part.name) {
+                                    totalTokens += this.countTextTokens(part.name);
+                                }
+                                if (part.id) {
+                                    totalTokens += this.countTextTokens(part.id);
+                                }
+                                if (part.input) {
+                                    totalTokens += this.countTextTokens(JSON.stringify(part.input));
+                                }
                             }
                         }
                     } else {
@@ -2062,12 +2833,12 @@ async initializeAuth(forceRefresh = false) {
                 }
             }
         }
-        
+
         // Count tools definitions tokens if present
         if (requestBody.tools && Array.isArray(requestBody.tools)) {
             totalTokens += this.countTextTokens(JSON.stringify(requestBody.tools));
         }
-        
+
         return totalTokens;
     }
 
