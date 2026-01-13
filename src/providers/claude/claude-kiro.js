@@ -269,6 +269,9 @@ class KiroCacheEstimator {
             this.config.historyTTL
         );
 
+        // 请求缓存 (key: prefixHash, value: cached prefix info)
+        this.requestCache = new Map();
+
         // 统计信息
         this.stats = {
             totalRequests: 0,
