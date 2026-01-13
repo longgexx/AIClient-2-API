@@ -58,6 +58,10 @@
                         <i class="fas fa-stream"></i>
                         <span>iFlow OAuth</span>
                     </button>
+                    <button type="button" class="provider-tag" data-value="claude-orchids-oauth">
+                        <i class="fas fa-seedling"></i>
+                        <span>Orchids OAuth</span>
+                    </button>
                 </div>
                 <small class="form-text" data-i18n="config.modelProviderHelp">点击选择启动时初始化的模型提供商 (必须至少选择一个)</small>
             </div>
@@ -109,6 +113,10 @@
                                 <i class="fas fa-stream"></i>
                                 <span>iFlow OAuth</span>
                             </button>
+                            <button type="button" class="provider-tag" data-value="claude-orchids-oauth">
+                                <i class="fas fa-seedling"></i>
+                                <span>Orchids OAuth</span>
+                            </button>
                         </div>
                         <small class="form-text" data-i18n="config.proxy.enabledProvidersNote">点击选择需要通过代理访问的提供商，未选中的提供商将直接连接</small>
                     </div>
@@ -151,6 +159,14 @@
                     <div class="form-group">
                         <label for="requestBaseDelay" data-i18n="config.advanced.baseDelay">重试基础延迟(毫秒)</label>
                         <input type="number" id="requestBaseDelay" class="form-control" min="0" step="100" value="1000">
+                    </div>
+                </div>
+                
+                <div class="config-row">
+                    <div class="form-group pool-section">
+                        <label for="credentialSwitchMaxRetries" data-i18n="config.advanced.credentialSwitchMaxRetries">坏凭证切换最大重试次数</label>
+                        <input type="number" id="credentialSwitchMaxRetries" class="form-control" min="1" max="50" value="5">
+                        <small class="form-text" data-i18n="config.advanced.credentialSwitchMaxRetriesNote">认证错误(401/403)后切换凭证的最大重试次数，默认 5 次</small>
                     </div>
                 </div>
                 
