@@ -22,11 +22,166 @@ const KIRO_THINKING = {
 
 // 缓存推测配置
 const CACHE_ESTIMATION_CONFIG = {
-    CACHE_TTL: 300000,              // 5分钟 TTL（与 Claude 官方一致）
-    MIN_CACHEABLE_TOKENS: 1024,     // 最小可缓存 token 数
+    HISTORY_TTL: 300000,            // 5分钟（Claude 默认缓存 TTL）
     MAX_CACHE_SIZE: 500,            // LRU 缓存最大条目数
+    CONFIDENCE_THRESHOLD: 20,       // 低于此值不应用推测（百分比）
+    MIN_MATCH_RATIO: 0.1,           // 最小匹配比例 10%
+    MIN_MATCHED_TOKENS: 1024,       // 最小匹配 token 数
     ENABLED: true,                  // 是否启用缓存推测
 };
+
+// 模型最小缓存阈值
+const MODEL_MIN_CACHE_TOKENS = {
+    'claude-opus-4-5': 4096,
+    'claude-opus-4': 1024,
+    'claude-sonnet-4-5': 1024,
+    'claude-sonnet-4': 1024,
+    'claude-sonnet-3-7': 1024,
+    'claude-haiku-4-5': 4096,
+    'claude-haiku-3-5': 2048,
+    'claude-haiku-3': 2048,
+    'default': 1024
+};
+
+// 块类型定义
+const BLOCK_TYPES = {
+    TOOLS: 'tools',
+    TOOL_CHOICE: 'tool_choice',
+    THINKING: 'thinking',
+    SYSTEM: 'system',
+    MESSAGE: 'message'
+};
+
+/**
+ * 获取模型的最小缓存 token 阈值
+ * @param {string} model - 模型名称
+ * @returns {number} 最小缓存 token 数
+ */
+function getMinCacheTokens(model) {
+    if (!model) return MODEL_MIN_CACHE_TOKENS.default;
+
+    // 精确匹配
+    if (MODEL_MIN_CACHE_TOKENS[model]) {
+        return MODEL_MIN_CACHE_TOKENS[model];
+    }
+
+    // 前缀匹配
+    for (const [prefix, tokens] of Object.entries(MODEL_MIN_CACHE_TOKENS)) {
+        if (prefix !== 'default' && model.startsWith(prefix)) {
+            return tokens;
+        }
+    }
+
+    return MODEL_MIN_CACHE_TOKENS.default;
+}
+
+/**
+ * FNV-1a 哈希函数（32位）
+ * @param {string} str - 要哈希的字符串
+ * @returns {string} 8字符十六进制哈希
+ */
+function fnv1aHash(str) {
+    let hash = 2166136261; // FNV offset basis
+    for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = Math.imul(hash, 16777619); // FNV prime
+        hash = hash >>> 0; // 保持32位无符号
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * 稳定 JSON 序列化（key 排序）
+ * @param {any} obj - 要序列化的对象
+ * @returns {string} 稳定的 JSON 字符串
+ */
+function stableStringify(obj) {
+    if (obj === null || obj === undefined) return '';
+    if (typeof obj !== 'object') return String(obj);
+
+    if (Array.isArray(obj)) {
+        return '[' + obj.map(item => stableStringify(item)).join(',') + ']';
+    }
+
+    const keys = Object.keys(obj).sort();
+    const parts = keys.map(key => {
+        const value = obj[key];
+        return JSON.stringify(key) + ':' + (
+            typeof value === 'object' && value !== null
+                ? stableStringify(value)
+                : JSON.stringify(value)
+        );
+    });
+    return '{' + parts.join(',') + '}';
+}
+
+/**
+ * 获取图片指纹（用于替代完整 base64）
+ * @param {string} base64 - base64 编码的图片数据
+ * @returns {string} 图片指纹
+ */
+function getImageFingerprint(base64) {
+    if (!base64 || typeof base64 !== 'string') return '';
+    const len = base64.length;
+    // 长度 + 首尾各 32 字符
+    const head = base64.substring(0, 32);
+    const tail = base64.substring(Math.max(0, len - 32));
+    return `img:${len}:${head}:${tail}`;
+}
+
+/**
+ * 规范化内容（移除动态字段）
+ * @param {any} content - 原始内容
+ * @returns {any} 规范化后的内容
+ */
+function normalizeContent(content) {
+    if (!content) return null;
+    if (typeof content === 'string') return content;
+
+    if (Array.isArray(content)) {
+        return content.map(item => normalizeContent(item));
+    }
+
+    if (typeof content === 'object') {
+        const normalized = {};
+        for (const [key, value] of Object.entries(content)) {
+            // 移除动态字段
+            if (['cache_control', 'id', 'tool_use_id', 'signature'].includes(key)) {
+                continue;
+            }
+            // 图片数据用指纹替代
+            if (key === 'data' && content.type === 'image') {
+                normalized[key] = getImageFingerprint(value);
+            } else if (typeof value === 'object' && value !== null) {
+                normalized[key] = normalizeContent(value);
+            } else {
+                normalized[key] = value;
+            }
+        }
+        return normalized;
+    }
+
+    return content;
+}
+
+/**
+ * 检查内容是否包含 cache_control
+ * @param {any} content - 内容
+ * @returns {boolean}
+ */
+function contentHasCacheControl(content) {
+    if (!content) return false;
+
+    if (typeof content === 'object' && content.cache_control) {
+        return true;
+    }
+
+    if (Array.isArray(content)) {
+        return content.some(item => contentHasCacheControl(item));
+    }
+
+    return false;
+}
 
 /**
  * 简单的 LRU 缓存实现
@@ -87,27 +242,30 @@ class SimpleLRUCache {
 }
 
 /**
- * Kiro 缓存推测器
+ * Kiro 缓存推测器（块级哈希匹配版本）
  * 用于推测 Prompt Caching 的缓存命中情况
  *
  * 设计原则：
- * 1. 基于前缀匹配：Claude 缓存是前缀匹配，相同的 system+tools 应该命中缓存
- * 2. 区分静态前缀和动态消息：只对静态前缀计算哈希
- * 3. 支持消息中的缓存断点：遇到 cache_control 时，缓存前缀在该消息之前截止
+ * 1. 块级序列化：按 Claude 顺序（tools → tool_choice → thinking → system → messages）
+ * 2. FNV-1a 哈希：每个块独立计算哈希
+ * 3. 前缀匹配：逐块比对找最长匹配前缀
+ * 4. 置信度计算：基于匹配比例 + token 数量加成 + 时间衰减
  */
 class KiroCacheEstimator {
     constructor(config = {}) {
         this.config = {
-            cacheTTL: config.cacheTTL || CACHE_ESTIMATION_CONFIG.CACHE_TTL,
-            minCacheableTokens: config.minCacheableTokens || CACHE_ESTIMATION_CONFIG.MIN_CACHEABLE_TOKENS,
+            historyTTL: config.historyTTL || CACHE_ESTIMATION_CONFIG.HISTORY_TTL,
             maxCacheSize: config.maxCacheSize || CACHE_ESTIMATION_CONFIG.MAX_CACHE_SIZE,
+            confidenceThreshold: config.confidenceThreshold || CACHE_ESTIMATION_CONFIG.CONFIDENCE_THRESHOLD,
+            minMatchRatio: config.minMatchRatio || CACHE_ESTIMATION_CONFIG.MIN_MATCH_RATIO,
+            minMatchedTokens: config.minMatchedTokens || CACHE_ESTIMATION_CONFIG.MIN_MATCHED_TOKENS,
             enabled: config.enabled !== false && CACHE_ESTIMATION_CONFIG.ENABLED
         };
 
-        // 请求缓存记录
-        this.requestCache = new SimpleLRUCache(
+        // 会话历史缓存 (key: accountId, value: SessionContentHistory)
+        this.historyCache = new SimpleLRUCache(
             this.config.maxCacheSize,
-            this.config.cacheTTL
+            this.config.historyTTL
         );
 
         // 统计信息
@@ -115,7 +273,9 @@ class KiroCacheEstimator {
             totalRequests: 0,
             estimatedCacheHits: 0,
             estimatedCacheCreations: 0,
-            belowThreshold: 0
+            skippedLowConfidence: 0,
+            skippedNoCacheControl: 0,
+            skippedBelowThreshold: 0
         };
     }
 
@@ -147,28 +307,41 @@ class KiroCacheEstimator {
         // 1. 提取可缓存内容（区分静态前缀和缓存消息，每个消息带独立哈希）
         const cacheableContent = this.extractCacheableContent(request);
 
-        // 2. 计算静态前缀的 token 数（system + tools）
+        // 2. 如果没有任何 cache_control，直接返回全部作为 uncached
+        if (!cacheableContent.hasCacheControl) {
+            return {
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                uncached_input_tokens: totalInputTokens,
+                _estimation: {
+                    estimated: true,
+                    source: 'no_cache_control',
+                    confidence: 1.0,
+                    totalInputTokens
+                }
+            };
+        }
+
+        // 3. 计算静态前缀的 token 数（system + tools）
         const staticPrefixTokens = this.countStaticPrefixTokens(cacheableContent);
 
-        // 3. 获取从头到 lastCacheBreakpoint 的所有消息 tokens
-        // Claude 缓存是前缀匹配的，会缓存到第一个 cache_control 之前的所有内容
+        // 4. 获取从头到 lastCacheBreakpoint 的所有消息 tokens
         const prefixMessagesTokens = cacheableContent.prefixMessagesTokens;
 
-        // 4. 检查 system 是否有 cache_control
+        // 5. 检查 system 和 tools 是否有 cache_control
         const systemHasCacheControl = cacheableContent.staticPrefix.systemHasCacheControl;
+        const toolsHasCacheControl = cacheableContent.staticPrefix.toolsHasCacheControl;
 
-        // 5. 总可缓存 token = 静态前缀 + 从头到断点的所有消息
-        // 如果 system 有 cache_control 但没有消息断点，静态前缀本身也可以被缓存
-        const totalCacheableTokens = systemHasCacheControl && prefixMessagesTokens === 0
-            ? staticPrefixTokens
-            : staticPrefixTokens + prefixMessagesTokens;
+        // 6. 总可缓存 token 计算
+        // 静态前缀只有在 system 或 tools 有 cache_control 时才计入缓存
+        const staticCacheable = (systemHasCacheControl || toolsHasCacheControl) ? staticPrefixTokens : 0;
+        const totalCacheableTokens = staticCacheable + prefixMessagesTokens;
 
-        // 6. 计算不参与缓存的 token（断点之后的消息）
+        // 7. 计算不参与缓存的 token（断点之后的消息）
         // uncached = total - cacheable
         const uncachedTokens = Math.max(0, totalInputTokens - totalCacheableTokens);
 
-        // 7. 检查是否满足最小缓存条件
-        // 如果 system 有 cache_control，静态前缀本身就可以被缓存
+        // 8. 检查是否满足最小缓存条件
         if (totalCacheableTokens < this.config.minCacheableTokens) {
             this.stats.belowThreshold++;
             return {
@@ -180,21 +353,23 @@ class KiroCacheEstimator {
                     source: 'below_threshold',
                     confidence: 0.95,
                     staticPrefixTokens,
+                    staticCacheable,
                     prefixMessagesTokens,
                     totalCacheableTokens,
                     uncachedTokens,
                     totalInputTokens,
                     systemHasCacheControl,
+                    toolsHasCacheControl,
                     lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
                     minRequired: this.config.minCacheableTokens
                 }
             };
         }
 
-        // 8. 计算静态前缀哈希（system + tools，不包含消息断点位置）
+        // 9. 计算静态前缀哈希（system + tools，不包含消息断点位置）
         const prefixHash = this.computeContentHash(cacheableContent, model);
 
-        // 9. 检查静态前缀是否命中
+        // 10. 检查静态前缀是否命中
         const cachedPrefix = this.requestCache.get(prefixHash);
 
         if (cachedPrefix) {
@@ -233,7 +408,8 @@ class KiroCacheEstimator {
             }
 
             // 计算 cache_read 和 cache_creation
-            let cacheRead = staticPrefixTokens;
+            // 静态前缀只有在 system 或 tools 有 cache_control 时才计入
+            let cacheRead = staticCacheable;
             let cacheCreation = 0;
 
             if (currentMessages.length === 0) {
@@ -262,6 +438,7 @@ class KiroCacheEstimator {
             // 更新缓存记录
             this.requestCache.set(prefixHash, {
                 staticPrefixTokens,
+                staticCacheable,
                 prefixMessagesTokens,
                 lastCacheBreakpoint,
                 cachedMessages: currentMessages.map(m => ({
@@ -286,11 +463,13 @@ class KiroCacheEstimator {
                     source,
                     confidence: 0.85,
                     staticPrefixTokens,
+                    staticCacheable,
                     prefixMessagesTokens,
                     totalCacheableTokens,
                     uncachedTokens,
                     totalInputTokens,
                     systemHasCacheControl,
+                    toolsHasCacheControl,
                     lastCacheBreakpoint,
                     lastMatchedBreakpoint,
                     hitCount: cachedPrefix.hitCount + 1,
@@ -305,6 +484,7 @@ class KiroCacheEstimator {
             // 存储每个消息的独立信息
             this.requestCache.set(prefixHash, {
                 staticPrefixTokens,
+                staticCacheable,
                 prefixMessagesTokens,
                 lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
                 cachedMessages: cacheableContent.cachedMessages.map(m => ({
@@ -325,11 +505,13 @@ class KiroCacheEstimator {
                     source: 'cache_creation',
                     confidence: 0.90,
                     staticPrefixTokens,
+                    staticCacheable,
                     prefixMessagesTokens,
                     totalCacheableTokens,
                     uncachedTokens,
                     totalInputTokens,
                     systemHasCacheControl,
+                    toolsHasCacheControl,
                     lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
                     contentHash: prefixHash
                 }
@@ -343,9 +525,9 @@ class KiroCacheEstimator {
      * 为每个缓存消息计算独立的哈希和 token 数
      *
      * 缓存推测策略：
-     * - system 和 tools 始终参与缓存推测（即使没有 cache_control）
-     * - Claude 缓存是前缀匹配的，会缓存从头到第一个 cache_control 之前的所有内容
-     * - 如果没有 cache_control，则所有消息都参与缓存前缀
+     * - 只有显式设置 cache_control 时才会创建/读取缓存
+     * - Claude 缓存是前缀匹配的，会缓存从头到 cache_control 标记位置（包含该位置）
+     * - 如果没有任何 cache_control，则不产生缓存
      */
     extractCacheableContent(request) {
         const cacheable = {
@@ -353,11 +535,14 @@ class KiroCacheEstimator {
             staticPrefix: {
                 system: null,
                 systemHasCacheControl: false,
+                toolsHasCacheControl: false,
                 tools: null
             },
+            // 是否有任何 cache_control 标记
+            hasCacheControl: false,
             // 缓存前缀内的消息（用于哈希比较，检测内容变化）
             cachedMessages: [],
-            // 缓存前缀的最后一个消息索引（遇到 cache_control 则在其前一条截止，否则为最后一条）
+            // 缓存前缀的最后一个消息索引（包含 cache_control 的消息）
             lastCacheBreakpoint: -1,
             // 从头到 lastCacheBreakpoint 的所有消息 tokens
             prefixMessagesTokens: 0,
@@ -365,7 +550,7 @@ class KiroCacheEstimator {
             allMessagesTokens: []
         };
 
-        // 1. System prompt - 始终参与缓存推测（即使没有 cache_control）
+        // 1. System prompt
         if (request.system) {
             cacheable.staticPrefix.system = request.system;
             // 检查是否有显式的 cache_control
@@ -374,22 +559,32 @@ class KiroCacheEstimator {
             } else if (typeof request.system === 'object' && request.system !== null && request.system.cache_control) {
                 cacheable.staticPrefix.systemHasCacheControl = true;
             }
+            if (cacheable.staticPrefix.systemHasCacheControl) {
+                cacheable.hasCacheControl = true;
+            }
         }
 
-        // 2. Tools 定义 - 始终参与缓存推测
+        // 2. Tools 定义 - 检查是否有 cache_control
         if (request.tools && request.tools.length > 0) {
             cacheable.staticPrefix.tools = request.tools;
+            // 检查 tools 数组最后一个元素是否有 cache_control
+            const lastTool = request.tools[request.tools.length - 1];
+            if (lastTool && lastTool.cache_control) {
+                cacheable.staticPrefix.toolsHasCacheControl = true;
+                cacheable.hasCacheControl = true;
+            }
         }
 
-        // 3. 遍历 messages，计算每个消息的 tokens，找到第一个 cache_control 的位置
+        // 3. 遍历 messages，计算每个消息的 tokens，找到最后一个 cache_control 的位置
         if (request.messages && request.messages.length > 0) {
-            // 查找第一个带 cache_control 的消息索引
-            let cacheControlIndex = -1;
+            // 查找最后一个带 cache_control 的消息索引
+            // Claude 缓存包含 cache_control 标记的消息本身
+            let lastCacheControlIndex = -1;
             for (let i = 0; i < request.messages.length; i++) {
                 const msg = request.messages[i];
                 if (this.messageHasCacheControl(msg)) {
-                    cacheControlIndex = i;
-                    break;
+                    lastCacheControlIndex = i;
+                    cacheable.hasCacheControl = true;
                 }
             }
 
@@ -402,13 +597,8 @@ class KiroCacheEstimator {
             }
 
             // 确定缓存前缀的范围
-            if (cacheControlIndex !== -1) {
-                // 有 cache_control：缓存到 cache_control 之前的所有消息
-                cacheable.lastCacheBreakpoint = cacheControlIndex - 1;
-            } else {
-                // 没有 cache_control：所有消息都参与缓存前缀
-                cacheable.lastCacheBreakpoint = request.messages.length - 1;
-            }
+            // Claude 缓存包含 cache_control 标记的消息本身
+            cacheable.lastCacheBreakpoint = lastCacheControlIndex;
 
             // 为缓存前缀内的每个消息计算哈希
             if (cacheable.lastCacheBreakpoint >= 0) {
