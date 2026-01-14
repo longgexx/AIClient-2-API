@@ -560,7 +560,17 @@ class KiroCacheEstimator {
             let cacheRead = staticCacheable;
             let cacheCreation = 0;
 
-            if (currentMessages.length === 0) {
+            if (CACHE_ESTIMATION_CONFIG.OPTIMISTIC_MATCHING) {
+                // 乐观模式：根据每条消息的匹配状态分别计算
+                for (const detail of matchDetails) {
+                    if (detail.status === 'hit') {
+                        cacheRead += detail.tokens;
+                    } else {
+                        // 'changed' 或 'new' 状态的消息计入 cache_creation
+                        cacheCreation += detail.tokens;
+                    }
+                }
+            } else if (currentMessages.length === 0) {
                 // 没有缓存前缀消息（lastCacheBreakpoint < 0），只有静态前缀
                 // 静态前缀命中，全部作为 cache_read
                 cacheCreation = 0;
