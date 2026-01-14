@@ -22,6 +22,22 @@ const KIRO_THINKING = {
     MAX_LEN_TAG: '<max_thinking_length>',
 };
 
+/**
+ * Kiro 缓存推测配置
+ *
+ * OPTIMISTIC_MATCHING (默认: true):
+ *   启用时，允许在消息序列中出现"空洞"的缓存命中。
+ *   示例：如果消息 [1,2,3,4,5] 存在，消息 3 改变但 4-5 与历史匹配，
+ *   则 [1,2] 和 [4,5] 都会被计为 cache_read。
+ *
+ *   ⚠️ 警告：这不反映 Claude 的实际缓存行为。
+ *   Claude 使用严格的前缀匹配 - 一旦前缀断裂，所有后续消息
+ *   都会变成 cache_creation，无论内容是否匹配。
+ *
+ *   此模式仅用于乐观估算。实际账单会更高。
+ *
+ *   禁用方式: KIRO_OPTIMISTIC_CACHE=false
+ */
 // 缓存推测配置
 const CACHE_ESTIMATION_CONFIG = {
     HISTORY_TTL: 300000,            // 5分钟（Claude 默认缓存 TTL）
@@ -33,6 +49,9 @@ const CACHE_ESTIMATION_CONFIG = {
     // tool_result 处理策略: 'strict'(严格匹配), 'ignore'(忽略变化), 'name_only'(只匹配工具名)
     TOOL_RESULT_STRATEGY: 'strict',
     DEBUG: process.env.KIRO_CACHE_DEBUG === 'true',  // 调试日志开关
+    // 乐观匹配模式：允许跳过中间不匹配的消息继续匹配后续消息（默认开启）
+    // 注意：这不反映 Claude 实际缓存行为，仅用于乐观估算
+    OPTIMISTIC_MATCHING: process.env.KIRO_OPTIMISTIC_CACHE !== 'false',
 };
 
 // 全局日志级别控制
@@ -439,50 +458,102 @@ class KiroCacheEstimator {
                 const currentMsg = currentMessages[i];
                 const previousMsg = previousMessages[i];
 
-                const isMatch = !prefixBroken &&
-                    previousMsg &&
+                // 检查内容是否匹配
+                const contentMatches = previousMsg &&
                     previousMsg.index === currentMsg.index &&
                     previousMsg.contentHash === currentMsg.contentHash;
 
-                // 调试日志：输出每条消息的哈希比较结果
-                if (CACHE_ESTIMATION_CONFIG.DEBUG) {
-                    console.log(`[Kiro Cache Debug] Message ${i}: ` +
-                        `index=${currentMsg.index}, ` +
-                        `currentHash=${currentMsg.contentHash}, ` +
-                        `previousHash=${previousMsg?.contentHash || 'N/A'}, ` +
-                        `tokens=${currentMsg.tokens}, ` +
-                        `match=${isMatch}, ` +
-                        `prefixBroken=${prefixBroken}`);
+                if (CACHE_ESTIMATION_CONFIG.OPTIMISTIC_MATCHING) {
+                    // 乐观模式：即使前面有不匹配，也继续检查当前消息
+                    // 调试日志：输出每条消息的哈希比较结果
+                    if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                        console.log(`[Kiro Cache Debug] [OPTIMISTIC] Message ${i}: ` +
+                            `index=${currentMsg.index}, ` +
+                            `currentHash=${currentMsg.contentHash}, ` +
+                            `previousHash=${previousMsg?.contentHash || 'N/A'}, ` +
+                            `tokens=${currentMsg.tokens}, ` +
+                            `match=${contentMatches}`);
 
-                    // 当哈希不匹配时，输出详细内容用于调试
-                    if (!isMatch && previousMsg && previousMsg.contentHash !== currentMsg.contentHash) {
-                        console.log(`[Kiro Cache Debug] === Message ${i} HASH MISMATCH ===`);
-                        console.log(`[Kiro Cache Debug]   Role: ${currentMsg.role}`);
-                        console.log(`[Kiro Cache Debug]   Content Type: ${currentMsg._debug?.contentType || 'unknown'}`);
-                        console.log(`[Kiro Cache Debug]   Current hashInput length: ${currentMsg._debug?.hashInputLength || 'N/A'}`);
-                        console.log(`[Kiro Cache Debug]   Previous hashInput length: ${previousMsg._debug?.hashInputLength || 'N/A'}`);
-                        console.log(`[Kiro Cache Debug]   Current preview: ${currentMsg._debug?.hashInputPreview || 'N/A'}`);
-                        console.log(`[Kiro Cache Debug]   Previous preview: ${previousMsg._debug?.hashInputPreview || 'N/A'}`);
-                        console.log(`[Kiro Cache Debug] === END MISMATCH ===`);
+                        // 当哈希不匹配时，输出详细内容用于调试
+                        if (!contentMatches && previousMsg && previousMsg.contentHash !== currentMsg.contentHash) {
+                            console.log(`[Kiro Cache Debug] ==={i} HASH MISMATCH ===`);
+                            console.log(`[Kiro Cache Debug]   Role: ${currentMsg.role}`);
+                            console.log(`[Kiro Cache Debug]   Content Type: ${currentMsg._debug?.contentType || 'unknown'}`);
+                            console.log(`[Kiro Cache Debug]   Current hashInput length: ${currentMsg._debug?.hashInputLength || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Previous hashInput length: ${previousMsg._debug?.hashInputLength || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Current preview: ${currentMsg._debug?.hashInputPreview || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Previous preview: ${previousMsg._debug?.hashInputPreview || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug] === END MISMATCH ===`);
+                        }
                     }
-                }
 
-                if (isMatch) {
-                    // 内容完全匹配且前缀未断
-                    lastMatchedBreakpoint = currentMsg.index;
-                    matchDetails.push({ index: currentMsg.index, status: 'hit', tokens: currentMsg.tokens });
+                    if (contentMatches) {
+                        // 内容匹配，标记为 cache_read
+                        lastMatchedBreakpoint = currentMsg.index;
+                        matchDetails.push({
+                            index: currentMsg.index,
+                            status: 'hit',
+                            tokens: currentMsg.tokens
+                        });
+                    } else {
+                        // 内容不匹配，标记为 cache_creation
+                        matchDetails.push({
+                            index: currentMsg.index,
+                            status: previousMsg ? 'changed' : 'new',
+                            tokens: currentMsg.tokens
+                        });
+                    }
                 } else {
-                    // 前缀断开，当前及后续全部是 cache_creation
-                    prefixBroken = true;
-                    matchDetails.push({
-                        index: currentMsg.index,
-                        status: previousMsg ? 'changed' : 'new',
-                        tokens: currentMsg.tokens
-                    });
+                    // 严格前缀匹配模式（原有逻辑）
+                    const isMatch = !prefixBroken && contentMatches;
+
+                    // 调试日志：输出每条消息的哈希比较结果
+                    if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                        console.log(`[Kiro Cache Debug] [STRICT] Message ${i}: ` +
+                            `index=${currentMsg.index}, ` +
+                            `currentHash=${currentMsg.contentHash}, ` +
+                            `previousHash=${previousMsg?.contentHash || 'N/A'}, ` +
+                            `tokens=${currentMsg.tokens}, ` +
+                            `match=${isMatch}, ` +
+                            `prefixBroken=${prefixBroken}`);
+
+                        // 当哈希不匹配时，输出详细内容用于调试
+                        if (!isMatch && previousMsg && previousMsg.contentHash !== currentMsg.contentHash) {
+                            console.log(`[Kiro Cache Debug] === Message ${i} HASH MISMATCH ===`);
+                            console.log(`[Kiro Cache Debug]   Role: ${currentMsg.role}`);
+                            console.log(`[Kiro Cache Debug]   Content Type: ${currentMsg._debug?.contentType || 'unknown'}`);
+                            console.log(`[Kiro Cache Debug]   Current hashInput length: ${currentMsg._debug?.hashInputLength || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Previous hashInput length: ${previousMsg._debug?.hashInputLength || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Current preview: ${currentMsg._debug?.hashInputPreview || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug]   Previous preview: ${previousMsg._debug?.hashInputPreview || 'N/A'}`);
+                            console.log(`[Kiro Cache Debug] === END MISMATCH ===`);
+                        }
+                    }
+
+                    if (isMatch) {
+                        // 内容完全匹配且前缀未断
+                        lastMatchedBreakpoint = currentMsg.index;
+                        matchDetails.push({
+                            index: currentMsg.index,
+                            status: 'hit',
+                            tokens: currentMsg.tokens
+                        });
+                    } else {
+                        // 前缀断开，当前及后续全部是 cache_creation
+                        prefixBroken = true;
+                        matchDetails.push({
+                            index: currentMsg.index,
+                            status: previousMsg ? 'changed' : 'new',
+                            tokens: currentMsg.tokens
+                        });
+                    }
                 }
             }
             if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                const mode = CACHE_ESTIMATION_CONFIG.OPTIMISTIC_MATCHING ? 'OPTIMISTIC' : 'STRICT';
+                console.log(`[Kiro Cache Debug] Mode: ${mode}`);
                 console.log(`[Kiro Cache Debug] Result: lastMatchedBreakpoint=${lastMatchedBreakpoint}, prefixBroken=${prefixBroken}, staticCacheable=${staticCacheable}`);
+                console.log(`[Kiro Cache Debug] Match details: ${matchDetails.map(m => `[${m.index}] ${m.status} (${m.tokens} tokens)`).join(', ')}`);
             }
 
             // 计算 cache_read 和 cache_creation
@@ -543,6 +614,7 @@ class KiroCacheEstimator {
                     estimated: true,
                     source,
                     confidence: 0.85,
+                    optimistic: CACHE_ESTIMATION_CONFIG.OPTIMISTIC_MATCHING,
                     staticPrefixTokens,
                     staticCacheable,
                     prefixMessagesTokens,
@@ -2842,7 +2914,8 @@ async initializeAuth(forceRefresh = false) {
             const cacheEstimation = cacheEstimator.estimateCacheTokens(requestBody, estimatedInputTokens, model);
 
             if (cacheEstimation._estimation?.estimated) {
-                console.log(`[Kiro] Cache estimation: source=${cacheEstimation._estimation.source}, ` +
+                const mode = cacheEstimation._estimation.optimistic ? '[OPTIMISTIC]' : '[STRICT]';
+                console.log(`[Kiro] ${mode} Cache estimation: source=${cacheEstimation._estimation.source}, ` +
                     `cache_read=${cacheEstimation.cache_read_input_tokens}, ` +
                     `cache_creation=${cacheEstimation.cache_creation_input_tokens}, ` +
                     `uncached=${cacheEstimation.uncached_input_tokens}, ` +
