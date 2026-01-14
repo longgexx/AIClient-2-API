@@ -61,13 +61,15 @@ export async function handleAPIRequests(method, path, req, res, currentConfig, a
  * Initialize API management features
  * @param {Object} services - The initialized services
  * @param {Object} config - The configuration object
- * @returns {Function} - The heartbeat and token refresh function
+ * @returns {Object} - Object containing heartbeat function and cleanup function
  */
 export function initializeAPIManagement(services, config = {}) {
     // 启动定期健康检查
     const healthCheckInterval = config.HEALTH_CHECK_INTERVAL || 120000; // 默认2分钟
+    let healthCheckTimer = null;
+
     if (healthCheckInterval > 0) {
-        setInterval(async () => {
+        healthCheckTimer = setInterval(async () => {
             try {
                 if (getProviderPoolManager()) {
                     await getProviderPoolManager().performHealthChecks();
@@ -79,7 +81,7 @@ export function initializeAPIManagement(services, config = {}) {
         console.log(`[Health Check] Periodic health check enabled with interval: ${healthCheckInterval}ms`);
     }
 
-    return async function heartbeatAndRefreshToken() {
+    const heartbeatAndRefreshToken = async function() {
         console.log(`[Heartbeat] Server is running. Current time: ${new Date().toLocaleString()}`, Object.keys(services));
         // 循环遍历所有已初始化的服务适配器，并尝试刷新令牌
         for (const providerKey in services) {
@@ -98,6 +100,21 @@ export function initializeAPIManagement(services, config = {}) {
             }
         }
     };
+
+    // 清理函数，用于优雅关闭时停止定时器
+    const cleanup = function() {
+        if (healthCheckTimer) {
+            clearInterval(healthCheckTimer);
+            healthCheckTimer = null;
+            console.log('[Health Check] Periodic health check stopped.');
+        }
+    };
+
+    // 返回对象以保持向后兼容，同时提供清理功能
+    // heartbeatAndRefreshToken 作为主要返回值，cleanup 作为属性
+    heartbeatAndRefreshToken.cleanup = cleanup;
+
+    return heartbeatAndRefreshToken;
 }
 
 /**

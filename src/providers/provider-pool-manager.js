@@ -27,7 +27,7 @@ export class ProviderPoolManager {
         this.roundRobinIndex = {}; // Tracks the current index for round-robin selection for each provider type
         // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
         this.maxErrorCount = options.maxErrorCount ?? 3; // Default to 3 errors before marking unhealthy
-        this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
+        this.healthCheckInterval = options.healthCheckInterval ?? 120000; // Default to 2 minutes (与 HEALTH_CHECK_INTERVAL 配置一致)
         
         // 日志级别控制
         this.logLevel = options.logLevel || 'info'; // 'debug', 'info', 'warn', 'error'
@@ -620,10 +620,10 @@ export class ProviderPoolManager {
      * Performs health checks on all providers in the pool.
      * This method would typically be called periodically (e.g., via cron job).
      */
-    async performHealthChecks(isInit = false) {
+    async performHealthChecks() {
         this._log('info', 'Performing health checks on all providers...');
         const now = new Date();
-        
+
         for (const providerType in this.providerStatus) {
             for (const providerStatus of this.providerStatus[providerType]) {
                 const providerConfig = providerStatus.config;
@@ -634,11 +634,10 @@ export class ProviderPoolManager {
                     continue;
                 }
 
-                // 不健康的提供商：如果距离上次错误 < 2分钟，跳过
-                const healthCheckRetryInterval = 120000; // 2分钟
+                // 不健康的提供商：如果距离上次错误时间小于健康检查间隔，跳过
                 if (providerStatus.config.lastErrorTime &&
-                    (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < healthCheckRetryInterval)) {
-                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent (within 2 minutes).`);
+                    (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < this.healthCheckInterval)) {
+                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent (within ${this.healthCheckInterval}ms).`);
                     continue;
                 }
 
