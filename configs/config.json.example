@@ -13,6 +13,12 @@
     "CRON_REFRESH_TOKEN": false,
     "PROVIDER_POOLS_FILE_PATH": "configs/provider_pools.json",
     "MAX_ERROR_COUNT": 3,
+    "stickySession": {
+      "enabled": true,
+      "ttlMs": 1800000,
+      "cleanupIntervalMs": 300000,
+      "maxSessions": 10000
+    },
     "providerFallbackChain": {
       "gemini-cli-oauth": ["gemini-antigravity"],
       "gemini-antigravity": ["gemini-cli-oauth"],

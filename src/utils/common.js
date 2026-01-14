@@ -137,6 +137,20 @@ export function getRequestBody(req) {
     });
 }
 
+/**
+ * 从 metadata.user_id 中提取 session ID
+ * metadata.user_id 格式: user_{64位hex}_account__session_{uuid}
+ * @param {Object} requestBody - 请求体
+ * @returns {string|null} session ID 或 null
+ */
+export function extractSessionId(requestBody) {
+    const userId = requestBody?.metadata?.user_id;
+    if (!userId) return null;
+
+    const match = userId.match(/session_([a-f0-9-]+)/i);
+    return match ? match[1] : null;
+}
+
 export async function logConversation(type, content, logMode, logFilename) {
     if (logMode === 'none') return;
     if (!content) return;
@@ -326,11 +340,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             console.log(`[Stream Retry] Credential marked unhealthy. Attempting retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            
+
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-                const result = await getApiServiceWithFallback(CONFIG, model);
+                const result = await getApiServiceWithFallback(CONFIG, model, { sessionId: retryContext?.sessionId });
                 
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -443,11 +457,11 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             console.log(`[Unary Retry] Credential marked unhealthy. Attempting retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            
+
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-                const result = await getApiServiceWithFallback(CONFIG, model);
+                const result = await getApiServiceWithFallback(CONFIG, model, { sessionId: retryContext?.sessionId });
                 
                 if (result && result.service && result.uuid !== pooluuid) {
                     console.log(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -557,6 +571,12 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         throw new Error("Request body is missing for content generation.");
     }
 
+    // 提取 session ID 用于粘性会话
+    const sessionId = extractSessionId(originalRequestBody);
+    if (sessionId) {
+        console.log(`[Content Generation] Session ID extracted: ${sessionId}`);
+    }
+
     const clientProviderMap = {
         [ENDPOINT_TYPE.OPENAI_CHAT]: MODEL_PROTOCOL_PREFIX.OPENAI,
         [ENDPOINT_TYPE.OPENAI_RESPONSES]: MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES,
@@ -568,7 +588,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // 使用实际的提供商类型（可能是 fallback 后的类型）
     let toProvider = CONFIG.actualProviderType || CONFIG.MODEL_PROVIDER;
     let actualUuid = pooluuid;
-    
+
     if (!fromProvider) {
         throw new Error(`Unsupported endpoint type for content generation: ${endpointType}`);
     }
@@ -587,13 +607,13 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // 注意：这里使用 skipUsageCount: true，因为初次选择时已经增加了 usageCount
     if (providerPoolManager && CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]) {
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model);
-        
+        const result = await getApiServiceWithFallback(CONFIG, model, { sessionId });
+
         service = result.service;
         toProvider = result.actualProviderType;
         actualUuid = result.uuid || pooluuid;
         actualCustomName = result.serviceConfig?.customName || CONFIG.customName;
-        
+
         // 如果发生了模型级别的 fallback，需要更新请求使用的模型
         if (result.actualModel && result.actualModel !== model) {
             console.log(`[Content Generation] Model Fallback: ${model} -> ${result.actualModel}`);
@@ -633,7 +653,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
     // 当没有不同的健康凭证可用时，重试会自动停止
     const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-    const retryContext = providerPoolManager ? { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries } : null;
+    const retryContext = providerPoolManager ? { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, sessionId } : null;
     
     if (isStream) {
         await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);

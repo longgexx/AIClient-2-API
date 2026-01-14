@@ -29,6 +29,25 @@ const CACHE_ESTIMATION_CONFIG = {
     MIN_MATCH_RATIO: 0.1,           // 最小匹配比例 10%
     MIN_MATCHED_TOKENS: 1024,       // 最小匹配 token 数
     ENABLED: true,                  // 是否启用缓存推测
+    // tool_result 处理策略: 'strict'(严格匹配), 'ignore'(忽略变化), 'name_only'(只匹配工具名)
+    TOOL_RESULT_STRATEGY: 'strict',
+    DEBUG: process.env.KIRO_CACHE_DEBUG === 'true',  // 调试日志开关
+};
+
+// 全局日志级别控制
+const LOG_LEVEL = {
+    DEBUG: process.env.KIRO_LOG_LEVEL === 'debug',
+    INFO: process.env.KIRO_LOG_LEVEL !== 'error' && process.env.KIRO_LOG_LEVEL !== 'warn',
+    WARN: process.env.KIRO_LOG_LEVEL !== 'error',
+    ERROR: true,
+};
+
+// 日志工具函数
+const logger = {
+    debug: (...args) => LOG_LEVEL.DEBUG && console.log(...args),
+    info: (...args) => LOG_LEVEL.INFO && console.log(...args),
+    warn: (...args) => LOG_LEVEL.WARN && console.warn(...args),
+    error: (...args) => LOG_LEVEL.ERROR && console.error(...args),
 };
 
 // 模型最小缓存阈值
@@ -44,14 +63,14 @@ const MODEL_MIN_CACHE_TOKENS = {
     'default': 1024
 };
 
-// 块类型定义
-const BLOCK_TYPES = {
-    TOOLS: 'tools',
-    TOOL_CHOICE: 'tool_choice',
-    THINKING: 'thinking',
-    SYSTEM: 'system',
-    MESSAGE: 'message'
-};
+// 块类型定义（保留用于未来扩展）
+// const BLOCK_TYPES = {
+//     TOOLS: 'tools',
+//     TOOL_CHOICE: 'tool_choice',
+//     THINKING: 'thinking',
+//     SYSTEM: 'system',
+//     MESSAGE: 'message'
+// };
 
 /**
  * 获取模型的最小缓存 token 阈值
@@ -76,45 +95,46 @@ function getMinCacheTokens(model) {
     return MODEL_MIN_CACHE_TOKENS.default;
 }
 
-/**
- * FNV-1a 哈希函数（32位）
- * @param {string} str - 要哈希的字符串
- * @returns {string} 8字符十六进制哈希
- */
-function fnv1aHash(str) {
-    let hash = 2166136261; // FNV offset basis
-    for (let i = 0; i < str.length; i++) {
-        hash ^= str.charCodeAt(i);
-        hash = Math.imul(hash, 16777619); // FNV prime
-        hash = hash >>> 0; // 保持32位无符号
-    }
-    return hash.toString(16).padStart(8, '0');
-}
+// 以下函数暂未使用，保留用于未来扩展
+// /**
+//  * FNV-1a 哈希函数（32位）
+//  * @param {string} str - 要哈希的字符串
+//  * @returns {string} 8字符十六进制哈希
+//  */
+// function fnv1aHash(str) {
+//     let hash = 2166136261; // FNV offset basis
+//     for (let i = 0; i < str.length; i++) {
+//         hash ^= str.charCodeAt(i);
+//         hash = Math.imul(hash, 16777619); // FNV prime
+//         hash = hash >>> 0; // 保持32位无符号
+//     }
+//     return hash.toString(16).padStart(8, '0');
+// }
 
-/**
- * 稳定 JSON 序列化（key 排序）
- * @param {any} obj - 要序列化的对象
- * @returns {string} 稳定的 JSON 字符串
- */
-function stableStringify(obj) {
-    if (obj === null || obj === undefined) return '';
-    if (typeof obj !== 'object') return String(obj);
-
-    if (Array.isArray(obj)) {
-        return '[' + obj.map(item => stableStringify(item)).join(',') + ']';
-    }
-
-    const keys = Object.keys(obj).sort();
-    const parts = keys.map(key => {
-        const value = obj[key];
-        return JSON.stringify(key) + ':' + (
-            typeof value === 'object' && value !== null
-                ? stableStringify(value)
-                : JSON.stringify(value)
-        );
-    });
-    return '{' + parts.join(',') + '}';
-}
+// /**
+//  * 稳定 JSON 序列化（key 排序）
+//  * @param {any} obj - 要序列化的对象
+//  * @returns {string} 稳定的 JSON 字符串
+//  */
+// function stableStringify(obj) {
+//     if (obj === null || obj === undefined) return '';
+//     if (typeof obj !== 'object') return String(obj);
+//
+//     if (Array.isArray(obj)) {
+//         return '[' + obj.map(item => stableStringify(item)).join(',') + ']';
+//     }
+//
+//     const keys = Object.keys(obj).sort();
+//     const parts = keys.map(key => {
+//         const value = obj[key];
+//         return JSON.stringify(key) + ':' + (
+//             typeof value === 'object' && value !== null
+//                 ? stableStringify(value)
+//                 : JSON.stringify(value)
+//         );
+//     });
+//     return '{' + parts.join(',') + '}';
+// }
 
 /**
  * 获取图片指纹（用于替代完整 base64）
@@ -130,59 +150,60 @@ function getImageFingerprint(base64) {
     return `img:${len}:${head}:${tail}`;
 }
 
-/**
- * 规范化内容（移除动态字段）
- * @param {any} content - 原始内容
- * @returns {any} 规范化后的内容
- */
-function normalizeContent(content) {
-    if (!content) return null;
-    if (typeof content === 'string') return content;
+// 以下函数暂未使用，保留用于未来扩展
+// /**
+//  * 规范化内容（移除动态字段）
+//  * @param {any} content - 原始内容
+//  * @returns {any} 规范化后的内容
+//  */
+// function normalizeContent(content) {
+//     if (!content) return null;
+//     if (typeof content === 'string') return content;
+//
+//     if (Array.isArray(content)) {
+//         return content.map(item => normalizeContent(item));
+//     }
+//
+//     if (typeof content === 'object') {
+//         const normalized = {};
+//         for (const [key, value] of Object.entries(content)) {
+//             // 移除动态字段
+//             if (['cache_control', 'id', 'tool_use_id', 'signature'].includes(key)) {
+//                 continue;
+//             }
+//             // 图片数据用指纹替代
+//             if (key === 'data' && content.type === 'image') {
+//                 normalized[key] = getImageFingerprint(value);
+//             } else if (typeof value === 'object' && value !== null) {
+//                 normalized[key] = normalizeContent(value);
+//             } else {
+//                 normalized[key] = value;
+//             }
+//         }
+//         return normalized;
+//     }
+//
+//     return content;
+// }
 
-    if (Array.isArray(content)) {
-        return content.map(item => normalizeContent(item));
-    }
-
-    if (typeof content === 'object') {
-        const normalized = {};
-        for (const [key, value] of Object.entries(content)) {
-            // 移除动态字段
-            if (['cache_control', 'id', 'tool_use_id', 'signature'].includes(key)) {
-                continue;
-            }
-            // 图片数据用指纹替代
-            if (key === 'data' && content.type === 'image') {
-                normalized[key] = getImageFingerprint(value);
-            } else if (typeof value === 'object' && value !== null) {
-                normalized[key] = normalizeContent(value);
-            } else {
-                normalized[key] = value;
-            }
-        }
-        return normalized;
-    }
-
-    return content;
-}
-
-/**
- * 检查内容是否包含 cache_control
- * @param {any} content - 内容
- * @returns {boolean}
- */
-function contentHasCacheControl(content) {
-    if (!content) return false;
-
-    if (typeof content === 'object' && content.cache_control) {
-        return true;
-    }
-
-    if (Array.isArray(content)) {
-        return content.some(item => contentHasCacheControl(item));
-    }
-
-    return false;
-}
+// /**
+//  * 检查内容是否包含 cache_control
+//  * @param {any} content - 内容
+//  * @returns {boolean}
+//  */
+// function contentHasCacheControl(content) {
+//     if (!content) return false;
+//
+//     if (typeof content === 'object' && content.cache_control) {
+//         return true;
+//     }
+//
+//     if (Array.isArray(content)) {
+//         return content.some(item => contentHasCacheControl(item));
+//     }
+//
+//     return false;
+// }
 
 /**
  * 简单的 LRU 缓存实现
@@ -199,21 +220,24 @@ class SimpleLRUCache {
         if (!item) return null;
 
         // 检查是否过期
-        if (Date.now() - item.timestamp > this.ttl) {
+        const now = Date.now();
+        if (now - item.timestamp > this.ttl) {
             this.cache.delete(key);
             return null;
         }
 
-        // LRU: 移到末尾
-        this.cache.delete(key);
-        this.cache.set(key, item);
+        // LRU: 更新时间戳（比删除再插入更高效）
+        item.timestamp = now;
         return item;
     }
 
     set(key, value) {
-        // 如果已存在，先删除
-        if (this.cache.has(key)) {
-            this.cache.delete(key);
+        // 如果已存在，直接更新（避免删除再插入）
+        const existing = this.cache.get(key);
+        if (existing) {
+            Object.assign(existing, value);
+            existing.timestamp = Date.now();
+            return;
         }
 
         // 检查容量
@@ -230,7 +254,24 @@ class SimpleLRUCache {
     }
 
     has(key) {
-        return this.get(key) !== null;
+        // 不调用 get() 以避免改变 LRU 顺序
+        const item = this.cache.get(key);
+        if (!item) return false;
+        // 检查是否过期
+        if (Date.now() - item.timestamp > this.ttl) {
+            this.cache.delete(key);
+            return false;
+        }
+        return true;
+    }
+
+    getValue(key) {
+        const item = this.get(key);
+        return item ? item.value : null;
+    }
+
+    setValue(key, value) {
+        this.set(key, { value });
     }
 
     get size() {
@@ -260,17 +301,16 @@ class KiroCacheEstimator {
             confidenceThreshold: config.confidenceThreshold || CACHE_ESTIMATION_CONFIG.CONFIDENCE_THRESHOLD,
             minMatchRatio: config.minMatchRatio || CACHE_ESTIMATION_CONFIG.MIN_MATCH_RATIO,
             minMatchedTokens: config.minMatchedTokens || CACHE_ESTIMATION_CONFIG.MIN_MATCHED_TOKENS,
-            enabled: config.enabled !== false && CACHE_ESTIMATION_CONFIG.ENABLED
+            minCacheableTokens: config.minCacheableTokens || CACHE_ESTIMATION_CONFIG.MIN_MATCHED_TOKENS,
+            enabled: config.enabled !== false && CACHE_ESTIMATION_CONFIG.ENABLED,
+            toolResultStrategy: config.toolResultStrategy || CACHE_ESTIMATION_CONFIG.TOOL_RESULT_STRATEGY
         };
 
-        // 会话历史缓存 (key: accountId, value: SessionContentHistory)
-        this.historyCache = new SimpleLRUCache(
+        // 请求缓存 (key: prefixHash, value: cached prefix info)，带 TTL 自动过期
+        this.requestCache = new SimpleLRUCache(
             this.config.maxCacheSize,
-            this.config.historyTTL
+            this.config.historyTTL  // 使用 5 分钟 TTL，与 Claude 缓存过期时间一致
         );
-
-        // 请求缓存 (key: prefixHash, value: cached prefix info)
-        this.requestCache = new Map();
 
         // 统计信息
         this.stats = {
@@ -313,6 +353,7 @@ class KiroCacheEstimator {
 
         // 2. 如果没有任何 cache_control，直接返回全部作为 uncached
         if (!cacheableContent.hasCacheControl) {
+            this.stats.skippedNoCacheControl++;
             return {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -347,7 +388,7 @@ class KiroCacheEstimator {
 
         // 8. 检查是否满足最小缓存条件
         if (totalCacheableTokens < this.config.minCacheableTokens) {
-            this.stats.belowThreshold++;
+            this.stats.skippedBelowThreshold++;
             return {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -370,11 +411,12 @@ class KiroCacheEstimator {
             };
         }
 
-        // 9. 计算静态前缀哈希（system + tools，不包含消息断点位置）
-        const prefixHash = this.computeContentHash(cacheableContent, model);
+        // 9. 计算静态前缀哈希（system + tools + tool_choice + thinking）
+        const prefixHash = this.computeContentHash(cacheableContent, model, request);
 
         // 10. 检查静态前缀是否命中
-        const cachedPrefix = this.requestCache.get(prefixHash);
+        const cachedPrefixItem = this.requestCache.get(prefixHash);
+        const cachedPrefix = cachedPrefixItem ? cachedPrefixItem.value : null;
 
         if (cachedPrefix) {
             // 静态前缀命中，逐个比较缓存前缀内的消息
@@ -389,14 +431,42 @@ class KiroCacheEstimator {
             let lastMatchedBreakpoint = -1;  // 最后一个匹配的消息索引
 
             // 逐个检查缓存前缀内的每个消息
+            if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                console.log(`[Kiro Cache Debug] prefixHash=${prefixHash}, currentMessages=${currentMessages.length}, previousMessages=${previousMessages.length}`);
+            }
             for (let i = 0; i < currentMessages.length; i++) {
                 const currentMsg = currentMessages[i];
                 const previousMsg = previousMessages[i];
 
-                if (!prefixBroken &&
+                const isMatch = !prefixBroken &&
                     previousMsg &&
                     previousMsg.index === currentMsg.index &&
-                    previousMsg.contentHash === currentMsg.contentHash) {
+                    previousMsg.contentHash === currentMsg.contentHash;
+
+                // 调试日志：输出每条消息的哈希比较结果
+                if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                    console.log(`[Kiro Cache Debug] Message ${i}: ` +
+                        `index=${currentMsg.index}, ` +
+                        `currentHash=${currentMsg.contentHash}, ` +
+                        `previousHash=${previousMsg?.contentHash || 'N/A'}, ` +
+                        `tokens=${currentMsg.tokens}, ` +
+                        `match=${isMatch}, ` +
+                        `prefixBroken=${prefixBroken}`);
+
+                    // 当哈希不匹配时，输出详细内容用于调试
+                    if (!isMatch && previousMsg && previousMsg.contentHash !== currentMsg.contentHash) {
+                        console.log(`[Kiro Cache Debug] === Message ${i} HASH MISMATCH ===`);
+                        console.log(`[Kiro Cache Debug]   Role: ${currentMsg.role}`);
+                        console.log(`[Kiro Cache Debug]   Content Type: ${currentMsg._debug?.contentType || 'unknown'}`);
+                        console.log(`[Kiro Cache Debug]   Current hashInput length: ${currentMsg._debug?.hashInputLength || 'N/A'}`);
+                        console.log(`[Kiro Cache Debug]   Previous hashInput length: ${previousMsg._debug?.hashInputLength || 'N/A'}`);
+                        console.log(`[Kiro Cache Debug]   Current preview: ${currentMsg._debug?.hashInputPreview || 'N/A'}`);
+                        console.log(`[Kiro Cache Debug]   Previous preview: ${previousMsg._debug?.hashInputPreview || 'N/A'}`);
+                        console.log(`[Kiro Cache Debug] === END MISMATCH ===`);
+                    }
+                }
+
+                if (isMatch) {
                     // 内容完全匹配且前缀未断
                     lastMatchedBreakpoint = currentMsg.index;
                     matchDetails.push({ index: currentMsg.index, status: 'hit', tokens: currentMsg.tokens });
@@ -410,6 +480,9 @@ class KiroCacheEstimator {
                     });
                 }
             }
+            if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                console.log(`[Kiro Cache Debug] Result: lastMatchedBreakpoint=${lastMatchedBreakpoint}, prefixBroken=${prefixBroken}, staticCacheable=${staticCacheable}`);
+            }
 
             // 计算 cache_read 和 cache_creation
             // 静态前缀只有在 system 或 tools 有 cache_control 时才计入
@@ -422,36 +495,39 @@ class KiroCacheEstimator {
                 cacheCreation = 0;
             } else if (!prefixBroken) {
                 // 所有消息都匹配，全部作为 cache_read
-                for (let i = 0; i <= lastCacheBreakpoint; i++) {
-                    cacheRead += allMessagesTokens[i];
+                for (let i = 0; i <= lastCacheBreakpoint && i < allMessagesTokens.length; i++) {
+                    cacheRead += allMessagesTokens[i] || 0;
                 }
                 cacheCreation = 0;
             } else {
                 // 部分匹配
                 if (lastMatchedBreakpoint >= 0) {
-                    for (let i = 0; i <= lastMatchedBreakpoint; i++) {
-                        cacheRead += allMessagesTokens[i];
+                    for (let i = 0; i <= lastMatchedBreakpoint && i < allMessagesTokens.length; i++) {
+                        cacheRead += allMessagesTokens[i] || 0;
                     }
                 }
                 // 从 lastMatchedBreakpoint+1 到 lastCacheBreakpoint 的消息作为 cache_creation
-                for (let i = lastMatchedBreakpoint + 1; i <= lastCacheBreakpoint; i++) {
-                    cacheCreation += allMessagesTokens[i];
+                for (let i = lastMatchedBreakpoint + 1; i <= lastCacheBreakpoint && i < allMessagesTokens.length; i++) {
+                    cacheCreation += allMessagesTokens[i] || 0;
                 }
             }
 
             // 更新缓存记录
             this.requestCache.set(prefixHash, {
-                staticPrefixTokens,
-                staticCacheable,
-                prefixMessagesTokens,
-                lastCacheBreakpoint,
-                cachedMessages: currentMessages.map(m => ({
-                    index: m.index,
-                    contentHash: m.contentHash,
-                    tokens: m.tokens
-                })),
-                allMessagesTokens: [...allMessagesTokens],
-                hitCount: (cachedPrefix.hitCount || 0) + 1
+                value: {
+                    staticPrefixTokens,
+                    staticCacheable,
+                    prefixMessagesTokens,
+                    lastCacheBreakpoint,
+                    cachedMessages: currentMessages.map(m => ({
+                        index: m.index,
+                        contentHash: m.contentHash,
+                        tokens: m.tokens,
+                        role: m.role
+                    })),
+                    allMessagesTokens: [...allMessagesTokens],
+                    hitCount: (cachedPrefix.hitCount || 0) + 1
+                }
             });
 
             const hasNewOrChanged = cacheCreation > 0;
@@ -487,17 +563,20 @@ class KiroCacheEstimator {
 
             // 存储每个消息的独立信息
             this.requestCache.set(prefixHash, {
-                staticPrefixTokens,
-                staticCacheable,
-                prefixMessagesTokens,
-                lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
-                cachedMessages: cacheableContent.cachedMessages.map(m => ({
-                    index: m.index,
-                    contentHash: m.contentHash,
-                    tokens: m.tokens
-                })),
-                allMessagesTokens: [...cacheableContent.allMessagesTokens],
-                hitCount: 0
+                value: {
+                    staticPrefixTokens,
+                    staticCacheable,
+                    prefixMessagesTokens,
+                    lastCacheBreakpoint: cacheableContent.lastCacheBreakpoint,
+                    cachedMessages: cacheableContent.cachedMessages.map(m => ({
+                        index: m.index,
+                        contentHash: m.contentHash,
+                        tokens: m.tokens,
+                        role: m.role
+                    })),
+                    allMessagesTokens: [...cacheableContent.allMessagesTokens],
+                    hitCount: 0
+                }
             });
 
             return {
@@ -608,12 +687,21 @@ class KiroCacheEstimator {
             if (cacheable.lastCacheBreakpoint >= 0) {
                 for (let i = 0; i <= cacheable.lastCacheBreakpoint; i++) {
                     const msg = request.messages[i];
+                    const hashInput = this.contentToTextForHash(msg.content, msg.role);
                     cacheable.cachedMessages.push({
                         index: i,
                         role: msg.role,
                         // 使用稳定字段计算哈希，排除易变的 tool_use_id/id/input
-                        contentHash: this.simpleHash(this.contentToTextForHash(msg.content, msg.role)),
-                        tokens: cacheable.allMessagesTokens[i]
+                        contentHash: this.simpleHash(hashInput),
+                        tokens: cacheable.allMessagesTokens[i],
+                        // 调试用：保存内容摘要（不存储完整内容以节省内存）
+                        _debug: CACHE_ESTIMATION_CONFIG.DEBUG ? {
+                            hashInputPreview: hashInput.substring(0, 200),
+                            hashInputLength: hashInput.length,
+                            contentType: Array.isArray(msg.content)
+                                ? msg.content.map(c => c?.type || typeof c).join(',')
+                                : typeof msg.content
+                        } : null
                     });
                     cacheable.prefixMessagesTokens += cacheable.allMessagesTokens[i];
                 }
@@ -659,9 +747,12 @@ class KiroCacheEstimator {
             tokens += this.countTokensSimple(systemText);
         }
 
-        // tools 始终计入缓存推测
+        // tools 始终计入缓存推测（使用缓存的序列化结果）
         if (cacheableContent.staticPrefix.tools) {
-            tokens += this.countTokensSimple(JSON.stringify(cacheableContent.staticPrefix.tools));
+            if (!cacheableContent._toolsJsonCache) {
+                cacheableContent._toolsJsonCache = JSON.stringify(cacheableContent.staticPrefix.tools);
+            }
+            tokens += this.countTokensSimple(cacheableContent._toolsJsonCache);
         }
 
         return tokens;
@@ -671,16 +762,24 @@ class KiroCacheEstimator {
      * 计算内容哈希（只包含静态前缀：system + tools）
      * 使用稳定字段，排除动态内容
      */
-    computeContentHash(cacheableContent, model) {
+    computeContentHash(cacheableContent, model, request = {}) {
         // 对 system 和 tools 使用稳定字段提取
         const stableSystem = this.extractStableFields(cacheableContent.staticPrefix.system);
         const stableTools = this.extractStableToolsFields(cacheableContent.staticPrefix.tools);
 
-        const hashInput = JSON.stringify({
+        // 缓存哈希输入字符串
+        const hashInputObj = {
             model: model,
             system: stableSystem,
-            tools: stableTools
-        });
+            tools: stableTools,
+            // 添加影响缓存行为的关键字段
+            tool_choice: request.tool_choice || null,
+            thinking: request.thinking ? {
+                type: request.thinking.type,
+                budget_tokens: request.thinking.budget_tokens
+            } : null
+        };
+        const hashInput = JSON.stringify(hashInputObj);
 
         return this.simpleHash(hashInput);
     }
@@ -777,8 +876,34 @@ class KiroCacheEstimator {
     }
 
     /**
+     * 规范化文本中的特殊字符（用于哈希计算）
+     * 将各种箭头字符统一为标准形式，避免编码差异导致哈希不匹配
+     */
+    normalizeTextForHash(text) {
+        if (!text || typeof text !== 'string') return text;
+
+        // 规范化各种箭头字符为标准 ASCII 箭头
+        // 包括：→ (U+2192), ← (U+2190), ↔ (U+2194), ⇒ (U+21D2), ➜ (U+279C) 等
+        // 以及可能的乱码/损坏字符
+        return text
+            .replace(/[→⇒➜➔➙➛►▶︎▸⮕]/g, '->')  // 右箭头类
+            .replace(/[←⇐◄◀︎◂⬅]/g, '<-')        // 左箭头类
+            .replace(/[↔⇔]/g, '<->')              // 双向箭头
+            .replace(/[\uFFFD�]/g, '->')           // 替换乱码字符（常见于损坏的箭头）
+            .replace(/[\u{E000}-\u{F8FF}]/gu, '') // 移除私用区字符
+            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // 移除控制字符
+            .replace(/(->){2,}/g, '->')            // 合并连续的 -> 为单个
+            .replace(/(<-){2,}/g, '<-')            // 合并连续的 <- 为单个
+            .replace(/(<->){2,}/g, '<->')          // 合并连续的 <-> 为单个
+            .replace(/\.{4,}/g, '...')             // 合并连续的点号为省略号
+            .replace(/-{3,}/g, '--')               // 合并连续的短横线
+            .replace(/_{3,}/g, '__')               // 合并连续的下划线
+            .replace(/\s+$/gm, '');                // 移除行尾空白
+    }
+
+    /**
      * 内容转文本（仅稳定字段，用于哈希计算）
-     * 排除易变字段：tool_use_id, id, input
+     * 排除易变字段：tool_use_id, id, input, cache_control
      * @param {any} content - 消息内容
      * @param {string} role - 消息角色（可选）
      */
@@ -788,21 +913,42 @@ class KiroCacheEstimator {
 
         if (!content) return parts.join(' ');
         if (typeof content === 'string') {
-            parts.push(content);
+            parts.push(this.normalizeTextForHash(content));
             return parts.join(' ');
         }
 
         if (Array.isArray(content)) {
             for (const c of content) {
                 if (typeof c === 'string') {
-                    parts.push(c);
+                    parts.push(this.normalizeTextForHash(c));
                     continue;
                 }
+
+                // tool_result 特殊处理：根据策略决定如何计算哈希
+                if (c.type === 'tool_result') {
+                    const strategy = this.config.toolResultStrategy || 'strict';
+
+                    // ignore 模式：完全跳过 tool_result，不参与哈希计算
+                    if (strategy === 'ignore') {
+                        continue;
+                    }
+
+                    parts.push(c.type);
+                    if (c.name) parts.push(c.name);
+
+                    if (strategy === 'strict') {
+                        // 严格模式：包含完整内容
+                        if (c.content) parts.push(this.contentToTextForHash(c.content));
+                    }
+                    // name_only 模式：只添加了 type 和 name，不添加 content
+                    continue;
+                }
+
                 // 只包含稳定字段
                 if (c.type) parts.push(c.type);
-                if (c.cache_control) parts.push(JSON.stringify(c.cache_control));
-                if (c.text) parts.push(c.text);
-                if (c.thinking) parts.push(c.thinking);
+                // 排除 cache_control：这是动态添加的缓存控制标记，不是消息内容
+                if (c.text) parts.push(this.normalizeTextForHash(c.text));
+                if (c.thinking) parts.push(this.normalizeTextForHash(c.thinking));
                 if (c.name) parts.push(c.name);  // 工具名是稳定的
                 // 排除: tool_use_id, id, input（这些每次请求都可能变化）
                 if (c.content) parts.push(this.contentToTextForHash(c.content));
@@ -814,7 +960,7 @@ class KiroCacheEstimator {
         if (typeof content === 'object') {
             let parts2 = [];
             if (content.type) parts2.push(content.type);
-            if (content.text) parts2.push(content.text);
+            if (content.text) parts2.push(this.normalizeTextForHash(content.text));
             if (content.name) parts2.push(content.name);
             return parts.concat(parts2).join(' ');
         }
@@ -830,7 +976,10 @@ class KiroCacheEstimator {
         try {
             return countTokens(text);
         } catch (e) {
-            // tokenizer 失败时 fallback
+            // tokenizer 失败时 fallback，添加警告日志
+            if (CACHE_ESTIMATION_CONFIG.DEBUG) {
+                console.warn(`[Kiro] Tokenizer failed, using fallback: ${e.message}`);
+            }
             return Math.ceil(text.length / 4);
         }
     }
@@ -894,14 +1043,22 @@ function cleanupExpiredAccountEstimators() {
         }
     }
 
-    // 如果超过最大数量，删除最久未使用的
+    // 如果超过最大数量，删除最久未使用的（使用迭代器避免创建大数组）
     if (accountCacheEstimators.size > ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS) {
-        const sortedEntries = [...accountCacheEstimators.entries()]
-            .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-
-        const toDelete = sortedEntries.slice(0, accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS);
-        for (const [accountId] of toDelete) {
-            accountCacheEstimators.delete(accountId);
+        const toDeleteCount = accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS;
+        // 找出最久未使用的条目
+        let oldestEntries = [];
+        for (const [accountId, entry] of accountCacheEstimators.entries()) {
+            oldestEntries.push({ accountId, lastUsed: entry.lastUsed });
+            // 只保留需要比较的数量，避免排序整个数组
+            if (oldestEntries.length > toDeleteCount * 2) {
+                oldestEntries.sort((a, b) => a.lastUsed - b.lastUsed);
+                oldestEntries = oldestEntries.slice(0, toDeleteCount);
+            }
+        }
+        oldestEntries.sort((a, b) => a.lastUsed - b.lastUsed);
+        for (let i = 0; i < toDeleteCount && i < oldestEntries.length; i++) {
+            accountCacheEstimators.delete(oldestEntries[i].accountId);
             cleanedCount++;
         }
     }
@@ -921,8 +1078,8 @@ function getCacheEstimatorForAccount(accountId, config = {}) {
     // 先清理过期的推测器
     cleanupExpiredAccountEstimators();
 
-    // 如果没有提供 accountId，使用默认标识
-    const effectiveAccountId = accountId || 'default';
+    // 如果没有提供 accountId，生成一个基于进程的唯一标识，避免不同服务共享缓存
+    const effectiveAccountId = accountId || `default_${process.pid}`;
 
     let entry = accountCacheEstimators.get(effectiveAccountId);
 
@@ -2288,8 +2445,10 @@ async initializeAuth(forceRefresh = false) {
         const events = [];
         let remaining = buffer;
         let searchStart = 0;
-        
-        while (true) {
+        const MAX_ITERATIONS = 1000; // 防止无限循环
+        let iterations = 0;
+
+        while (iterations++ < MAX_ITERATIONS) {
             // 查找真正的 JSON payload 起始位置
             // AWS Event Stream 包含二进制头部，我们只搜索有效的 JSON 模式
             // Kiro 返回格式: {"content":"..."} 或 {"name":"xxx","toolUseId":"xxx",...} 或 {"followupPrompt":"..."}
@@ -2428,130 +2587,138 @@ async initializeAuth(forceRefresh = false) {
 
     /**
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
+     * 使用循环代替递归避免栈溢出
      */
     async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
-        const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
+        // 使用循环代替递归重试
+        let currentRetryCount = retryCount;
+        let currentIsRetry = isRetry;
 
-        const token = this.accessToken;
-        const headers = {
-            'Authorization': `Bearer ${token}`,
-            'amz-sdk-invocation-id': `${uuidv4()}`,
-        };
+        while (currentRetryCount <= maxRetries) {
+            const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system, body.thinking);
 
-        const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
+            const token = this.accessToken;
+            const headers = {
+                'Authorization': `Bearer ${token}`,
+                'amz-sdk-invocation-id': `${uuidv4()}`,
+            };
 
-        let stream = null;
-        try {
-            const response = await this.axiosInstance.post(requestUrl, requestData, { 
-                headers,
-                responseType: 'stream'
-            });
+            const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
-            stream = response.data;
-            let buffer = '';
-            let lastContentEvent = null;  // 用于检测连续重复的 content 事件
+            let stream = null;
+            try {
+                const response = await this.axiosInstance.post(requestUrl, requestData, {
+                    headers,
+                    responseType: 'stream'
+                });
 
-            for await (const chunk of stream) {
-                buffer += chunk.toString();
-                
-                // 解析缓冲区中的事件
-                const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
-                buffer = remaining;
-                
-                // yield 所有事件，但过滤连续完全相同的 content 事件（Kiro API 有时会重复发送）
-                for (const event of events) {
-                    if (event.type === 'content' && event.data) {
-                        // 检查是否与上一个 content 事件完全相同
-                        if (lastContentEvent === event.data) {
-                            // 跳过重复的内容
-                            continue;
+                stream = response.data;
+                let buffer = '';
+                let lastContentEvent = null;
+                const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+
+                for await (const chunk of stream) {
+                    buffer += chunk.toString();
+
+                    if (buffer.length > MAX_BUFFER_SIZE) {
+                        console.error('[Kiro] Stream buffer overflow, clearing buffer');
+                        buffer = '';
+                        continue;
+                    }
+
+                    const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
+                    buffer = remaining;
+
+                    for (const event of events) {
+                        if (event.type === 'content' && event.data) {
+                            if (lastContentEvent === event.data) {
+                                continue;
+                            }
+                            lastContentEvent = event.data;
+                            yield { type: 'content', content: event.data };
+                        } else if (event.type === 'toolUse') {
+                            yield { type: 'toolUse', toolUse: event.data };
+                        } else if (event.type === 'toolUseInput') {
+                            yield { type: 'to', input: event.data.input };
+                        } else if (event.type === 'toolUseStop') {
+                            yield { type: 'toolUseStop', stop: event.data.stop };
+                        } else if (event.type === 'contextUsage') {
+                            yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
                         }
-                        lastContentEvent = event.data;
-                        yield { type: 'content', content: event.data };
-                    } else if (event.type === 'toolUse') {
-                        yield { type: 'toolUse', toolUse: event.data };
-                    } else if (event.type === 'toolUseInput') {
-                        yield { type: 'toolUseInput', input: event.data.input };
-                    } else if (event.type === 'toolUseStop') {
-                        yield { type: 'toolUseStop', stop: event.data.stop };
-                    } else if (event.type === 'contextUsage') {
-                        yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
                     }
                 }
-            }
-        } catch (error) {
-            // 确保出错时关闭流
-            if (stream && typeof stream.destroy === 'function') {
-                stream.destroy();
-            }
-            
-            const status = error.response?.status;
-            const errorCode = error.code;
-            const errorMessage = error.message || '';
-            
-            // 检查是否为可重试的网络错误
-            const isNetworkError = isRetryableNetworkError(error);
-            
-            // Handle 401 (Unauthorized) - try to refresh token first
-            if (status === 401 && !isRetry) {
-                console.log('[Kiro] Received 401 in stream. Attempting token refresh...');
-                try {
-                    await this.initializeAuth(true); // Force refresh token
-                    console.log('[Kiro] Token refresh successful after 401, retrying stream...');
-                    yield* this.streamApiReal(method, model, body, true, retryCount);
-                    return;
-                } catch (refreshError) {
-                    console.error('[Kiro] Token refresh failed during 401 retry:', refreshError.message);
-                    // Mark credential as unhealthy immediately and attach marker to error
-                    this._markCredentialUnhealthy('401 Unauthorized - Token refresh failed', refreshError);
-                    throw refreshError;
+                // 成功完成，退出循环
+                return;
+            } catch (error) {
+                if (stream && typeof stream.destroy === 'function') {
+                    stream.destroy();
                 }
-            }
-            
-            // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
-            if (status === 403) {
-                console.log('[Kiro] Received 403 in stream. Marking credential as unhealthy...');
-                this._markCredentialUnhealthy('403 Forbidden', error);
+
+                const status = error.response?.status;
+                const errorCode = error.code;
+                const errorMessage = error.message || '';
+                const isNetworkError = isRetryableNetworkError(error);
+
+                // Handle 401 (Unauthorized) - try to refresh token first
+                if (status === 401 && !currentIsRetry) {
+                    console.log('[Kiro] Received 401 in stream. Attempting token refresh...');
+                    try {
+                        await this.initializeAuth(true);
+                        console.log('[Kiro] Token refresh successful after 401, retrying stream...');
+                        currentIsRetry = true;
+                        continue; // 重试
+                    } catch (refreshError) {
+                        console.error('[Kiro] Token refresh failed during 401 retry:', refreshError.message);
+                        this._markCredentialUnhealthy('401 Unauthorized - Token refresh failed', refreshError);
+                        throw refreshError;
+                    }
+                }
+
+                // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
+                if (status === 403) {
+                    console.log('[Kiro] Received 403 in stream. Marking credential as unhealthy...');
+                    this._markCredentialUnhealthy('403 Forbidden', error);
+                    throw error;
+                }
+
+                // Handle 429 with retry
+                if (status === 429 && currentRetryCount < maxRetries) {
+                    const delay = baseDelay * Math.pow(2, currentRetryCount);
+                    console.log(`[Kiro] Received 429 in stream. Retrying in ${delay}ms... (attempt ${currentRetryCount + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    currentRetryCount++;
+                    continue;
+                }
+
+                // Handle 5xx server errors with exponential backoff
+                if (status >= 500 && status < 600 && currentRetryCount < maxRetries) {
+                    const delay = baseDelay * Math.pow(2, currentRetryCount);
+                    console.log(`[Kiro] Received ${status} server error in stream. Retrying in ${delay}ms... (attempt ${currentRetryCount + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    currentRetryCount++;
+                    continue;
+                }
+
+                // Handle network errors with exponential backoff
+                if (isNetworkError && currentRetryCount < maxRetries) {
+                    const delay = baseDelay * Math.pow(2, currentRetryCount);
+                    const errorIdentifier = errorCode || errorMessage.substring(0, 50);
+                    console.log(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${currentRetryCount + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    currentRetryCount++;
+                    continue;
+                }
+
+                console.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
                 throw error;
-            }
-            
-            if (status === 429 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received 429 in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
-                return;
-            }
-
-            // Handle 5xx server errors with exponential backoff
-            if (status >= 500 && status < 600 && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                console.log(`[Kiro] Received ${status} server error in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
-                return;
-            }
-
-            // Handle network errors (ECONNRESET, ETIMEDOUT, etc.) with exponential backoff
-            if (isNetworkError && retryCount < maxRetries) {
-                const delay = baseDelay * Math.pow(2, retryCount);
-                const errorIdentifier = errorCode || errorMessage.substring(0, 50);
-                console.log(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
-                return;
-            }
-
-            console.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`, error.message);
-            throw error;
-        } finally {
-            // 确保流被关闭，释放资源
-            if (stream && typeof stream.destroy === 'function') {
-                stream.destroy();
+            } finally {
+                if (stream && typeof stream.destroy === 'function') {
+                    stream.destroy();
+                }
             }
         }
     }
@@ -2709,6 +2876,17 @@ async initializeAuth(forceRefresh = false) {
                     }
 
                     streamState.buffer += event.content;
+
+                    // 缓冲区溢出保护（thinking 标签未闭合时）
+                    const MAX_THINKING_BUFFER = 5 * 1024 * 1024; // 5MB
+                    if (streamState.buffer.length > MAX_THINKING_BUFFER) {
+                        console.error('[Kiro] Thinking buffer overflow, flushing as text');
+                        yield* pushEvents(createTextDeltaEvents(streamState.buffer));
+                        streamState.buffer = '';
+                        streamState.inThinking = false;
+                        continue;
+                    }
+
                     const events = [];
 
                     while (streamState.buffer.length > 0) {
@@ -3027,6 +3205,15 @@ async initializeAuth(forceRefresh = false) {
                                 }
                                 if (part.input) {
                                     totalTokens += this.countTextTokens(JSON.stringify(part.input));
+                                }
+                            } else if (part.type === 'image') {
+                                // 图片固定约 1600 tokens（根据 Claude 文档估算）
+                                totalTokens += 1600;
+                            } else if (part.type === 'document') {
+                                // 文档根据 base64 数据估算
+                                if (part.source?.data) {
+                                    const estimatedChars = part.source.data.length * 0.75; // base64 to bytes ratio
+                                    totalTokens += Math.ceil(estimatedChars / 4);
                                 }
                             }
                         }

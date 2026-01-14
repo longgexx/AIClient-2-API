@@ -39,11 +39,25 @@ export class ProviderPoolManager {
         
         // Fallback 链配置
         this.fallbackChain = options.globalConfig?.providerFallbackChain || {};
-        
+
         // Model Fallback 映射配置
         this.modelFallbackMapping = options.globalConfig?.modelFallbackMapping || {};
 
+        // 粘性会话配置
+        this.stickySessionConfig = {
+            enabled: options.stickySession?.enabled ?? false,
+            ttlMs: options.stickySession?.ttlMs ?? 30 * 60 * 1000,  // 默认30分钟过期
+            cleanupIntervalMs: options.stickySession?.cleanupIntervalMs ?? 5 * 60 * 1000,  // 清理间隔5分钟
+            maxSessions: options.stickySession?.maxSessions ?? 10000  // 最大会话数
+        };
+        this.stickySessionMap = new Map();
+
         this.initializeProviderStatus();
+
+        // 启动粘性会话清理定时器
+        if (this.stickySessionConfig.enabled) {
+            this._startSessionCleanupTask();
+        }
     }
 
     /**
@@ -113,6 +127,8 @@ export class ProviderPoolManager {
      * If requestedModel is provided, providers that don't support the model will be excluded.
      * @param {string} providerType - The type of provider to select (e.g., 'gemini-cli', 'openai-custom').
      * @param {string} [requestedModel] - Optional. The model name to filter providers by.
+     * @param {Object} [options] - Optional. Additional options.
+     * @param {string} [options.sessionId] - Optional. Session ID for sticky session support.
      * @returns {object|null} The selected provider's configuration, or null if no healthy provider is found.
      */
     selectProvider(providerType, requestedModel = null, options = {}) {
@@ -122,6 +138,32 @@ export class ProviderPoolManager {
             return null;
         }
 
+        const { sessionId, skipUsageCount, isFromFallback } = options;
+
+        // ========== 粘性会话逻辑 ==========
+        if (this.stickySessionConfig.enabled && sessionId) {
+            const stickyResult = this._trySelectFromStickySession(providerType, requestedModel, sessionId);
+
+            if (stickyResult) {
+                this._log('debug', `Sticky session hit for session: ${sessionId}, provider: ${stickyResult.uuid}`);
+
+                // 更新会话访问时间
+             this._updateStickySessionAccess(sessionId);
+
+                // 更新使用信息
+                if (!skipUsageCount) {
+                    stickyResult.lastUsed = new Date().toISOString();
+                    stickyResult.usageCount++;
+                    this._debouncedSave(providerType);
+                }
+
+                return stickyResult;
+            }
+
+            this._log('debug', `Sticky session miss for session: ${sessionId}, falling back to LRU`);
+        }
+
+        // ========== 原有 LRU 逻辑 ==========
         const availableProviders = this.providerStatus[providerType] || [];
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled
@@ -152,7 +194,7 @@ export class ProviderPoolManager {
             return null;
         }
 
-        // 改进：使用“最久未被使用”策略（LRU）代替取模轮询
+        // 改进：使用"最久未被使用"策略（LRU）代替取模轮询
         // 这样即使可用列表长度动态变化，也能确保每个账号被平均轮到
         const selected = availableAndHealthyProviders.sort((a, b) => {
             const timeA = a.config.lastUsed ? new Date(a.config.lastUsed).getTime() : 0;
@@ -162,17 +204,24 @@ export class ProviderPoolManager {
             // 如果时间相同，使用使用次数辅助判断
             return (a.config.usageCount || 0) - (b.config.usageCount || 0);
         })[0];
-        
+
+        // ========== 创建粘性会话绑定 ==========
+        // 仅在非 fallback 场景下创建绑定，避免覆盖原有绑定
+        if (this.stickySessionConfig.enabled && sessionId && !isFromFallback) {
+            this._createStickySession(sessionId, providerType, selected.config.uuid);
+            this._log('info', `Created sticky session for session: ${sessionId} -> provider: ${selected.config.uuid}`);
+        }
+
         // 更新使用信息（除非明确跳过）
-        if (!options.skipUsageCount) {
+        if (!skipUsageCount) {
             selected.config.lastUsed = new Date().toISOString();
             selected.config.usageCount++;
             // 使用防抖保存
             this._debouncedSave(providerType);
         }
 
-        this._log('debug', `Selected provider for ${providerType} (round-robin): ${selected.config.uuid}${requestedModel ? ` for model: ${requestedModel}` : ''}${options.skipUsageCount ? ' (skip usage count)' : ''}`);
-        
+        this._log('debug', `Selected provider for ${providerType} (round-robin): ${selected.config.uuid}${requestedModel ? ` for model: ${requestedModel}` : ''}${skipUsageCount ? ' (skip usage count)' : ''}`);
+
         return selected.config;
     }
 
@@ -238,7 +287,11 @@ export class ProviderPoolManager {
             }
 
             // 尝试从当前类型选择提供商
-            const selectedConfig = this.selectProvider(currentType, requestedModel, options);
+            // 当 currentType 不是主类型时，标记为 fallback 以避免覆盖原有粘性会话绑定
+            const selectedConfig = this.selectProvider(currentType, requestedModel, {
+                ...options,
+                isFromFallback: currentType !== providerType
+            });
             
             if (selectedConfig) {
                 if (currentType !== providerType) {
@@ -271,7 +324,11 @@ export class ProviderPoolManager {
                 // 检查目标类型是否有配置的池
                 if (this.providerStatus[targetProviderType] && this.providerStatus[targetProviderType].length > 0) {
                     // 尝试从目标类型选择提供商（使用转换后的模型名）
-                    const selectedConfig = this.selectProvider(targetProviderType, targetModel, options);
+                    // Model Mapping 也是 fallback 场景，标记 isFromFallback 避免覆盖原有绑定
+                    const selectedConfig = this.selectProvider(targetProviderType, targetModel, {
+                        ...options,
+                        isFromFallback: true
+                    });
                     
                     if (selectedConfig) {
                         this._log('info', `Fallback activated (Model Mapping): ${providerType} (${requestedModel}) -> ${targetProviderType} (${targetModel}) (uuid: ${selectedConfig.uuid})`);
@@ -299,7 +356,10 @@ export class ProviderPoolManager {
                              const supportedModels = getProviderModels(fallbackType);
                              if (supportedModels.length > 0 && !supportedModels.includes(targetModel)) continue;
                              
-                             const fallbackSelectedConfig = this.selectProvider(fallbackType, targetModel, options);
+                             const fallbackSelectedConfig = this.selectProvider(fallbackType, targetModel, {
+                                 ...options,
+                                 isFromFallback: true
+                             });
                              if (fallbackSelectedConfig) {
                                  this._log('info', `Fallback activated (Model Mapping -> Chain): ${providerType} (${requestedModel}) -> ${targetProviderType} -> ${fallbackType} (${targetModel}) (uuid: ${fallbackSelectedConfig.uuid})`);
                                  return {
@@ -813,6 +873,207 @@ export class ProviderPoolManager {
         } catch (error) {
             this._log('error', `Failed to write provider_pools.json: ${error.message}`);
         }
+    }
+
+    // ========== 粘性会话相关方法 ==========
+
+    /**
+     * 尝试从粘性会话中选择提供商
+     * @private
+     * @param {string} providerType - 提供商类型
+     * @param {string} requestedModel - 请求的模型
+     * @param {string} sessionId - 会话 ID
+     * @returns {object|null} 提供商配置或 null
+     */
+    _trySelectFromStickySession(providerType, requestedModel, sessionId) {
+        const session = this.stickySessionMap.get(sessionId);
+
+        if (!session) {
+            return null;
+        }
+
+        // 检查会话是否过期
+        const now = Date.now();
+        if (now - session.lastAccessedAt > this.stickySessionConfig.ttlMs) {
+            this._log('debug', `Sticky session expired for session: ${sessionId}`);
+            this.stickySessionMap.delete(sessionId);
+            return null;
+        }
+
+        // 检查绑定的提供商类型是否匹配
+        if (session.providerType !== providerType) {
+            this._log('debug', `Provider type mismatch for sticky session: ${session.providerType} vs ${providerType}`);
+            return null;
+        }
+
+        // 查找绑定的提供商
+        const provider = this._findProvider(providerType, session.providerUuid);
+
+        if (!provider) {
+            this._log('warn', `Bound provider not found: ${session.providerUuid}`);
+            this.stickySessionMap.delete(sessionId);
+            return null;
+        }
+
+        // 检查提供商是否健康且未禁用
+        if (!provider.config.isHealthy || provider.config.isDisabled) {
+            this._log('warn', `Bound provider unhealthy/disabled: ${session.providerUuid}, removing sticky session`);
+            this.stickySessionMap.delete(sessionId);
+            return null;  // 返回 null 触发 fallback 到 LRU
+        }
+
+        // 检查模型支持
+        if (requestedModel && provider.config.notSupportedModels?.includes(requestedModel)) {
+            this._log('warn', `Bound provider doesn't support model: ${requestedModel}`);
+            // 不删除会话，只是本次请求 fallback
+            return null;
+        }
+
+        return provider.config;
+    }
+
+    /**
+     * 创建粘性会话
+     * @private
+     * @param {string} sessionId - 会话 ID
+     * @param {string} providerType - 提供商类型
+     * @param {string} providerUuid - 提供商 UUID
+     */
+    _createStickySession(sessionId, providerType, providerUuid) {
+        // 检查是否超过最大会话数
+        if (this.stickySessionMap.size >= this.stickySessionConfig.maxSessions) {
+            this._evictOldestSessions(Math.floor(this.stickySessionConfig.maxSessions * 0.1));
+        }
+
+        const now = Date.now();
+        this.stickySessionMap.set(sessionId, {
+            providerType,
+            providerUuid,
+            createdAt: now,
+            lastAccessedAt: now,
+            requestCount: 1
+        });
+    }
+
+    /**
+     * 更新粘性会话访问时间
+     * @private
+     * @param {string} sessionId - 会话 ID
+     */
+    _updateStickySessionAccess(sessionId) {
+        const session = this.stickySessionMap.get(sessionId);
+        if (session) {
+            session.lastAccessedAt = Date.now();
+            session.requestCount++;
+        }
+    }
+
+    /**
+     * 启动会话清理定时任务
+     * @private
+     */
+    _startSessionCleanupTask() {
+        this.cleanupTimer = setInterval(() => {
+            this._cleanupExpiredSessions();
+        }, this.stickySessionConfig.cleanupIntervalMs);
+
+        // 确保进程退出时清理定时器
+        if (this.cleanupTimer.unref) {
+            this.cleanupTimer.unref();
+        }
+
+        this._log('info', `Sticky session cleanup task started (interval: ${this.stickySessionConfig.cleanupIntervalMs}ms, ttl: ${this.stickySessionConfig.ttlMs}ms)`);
+    }
+
+    /**
+     * 清理过期会话
+     * @private
+     */
+    _cleanupExpiredSessions() {
+        const now = Date.now();
+        const ttl = this.stickySessionConfig.ttlMs;
+        let cleanedCount = 0;
+
+        for (const [sessionId, session] of this.stickySessionMap.entries()) {
+            if (now - session.lastAccessedAt > ttl) {
+                this.stickySessionMap.delete(sessionId);
+                cleanedCount++;
+            }
+        }
+
+        if (cleanedCount > 0) {
+            this._log('info', `Cleaned up ${cleanedCount} expired sticky sessions. Remaining: ${this.stickySessionMap.size}`);
+        }
+    }
+
+    /**
+     * 淘汰最旧的会话
+     * @private
+     * @param {number} count - 要淘汰的会话数量
+     */
+    _evictOldestSessions(count) {
+        const sessions = Array.from(this.stickySessionMap.entries())
+            .sort((a, b) => a[1].lastAccessedAt - b[1].lastAccessedAt);
+
+        for (let i = 0; i < Math.min(count, sessions.length); i++) {
+            this.stickySessionMap.delete(sessions[i][0]);
+        }
+
+        this._log('info', `Evicted ${Math.min(count, sessions.length)} oldest sticky sessions`);
+    }
+
+    /**
+     * 获取粘性会话统计信息
+     * @returns {object} 统计信息
+     */
+    getStickySessionStats() {
+        return {
+            enabled: this.stickySessionConfig.enabled,
+            totalSessions: this.stickySessionMap.size,
+            maxSessions: this.stickySessionConfig.maxSessions,
+            ttlMs: this.stickySessionConfig.ttlMs
+        };
+    }
+
+    /**
+     * 手动清除指定客户端的粘性会话
+     * @param {string} sessionId - 会话 ID
+     * @returns {boolean} 是否成功删除
+     */
+    clearStickySession(sessionId) {
+        const deleted = this.stickySessionMap.delete(sessionId);
+        if (deleted) {
+            this._log('info', `Manually cleared sticky session for: ${sessionId}`);
+        }
+        return deleted;
+    }
+
+    /**
+     * 清除所有粘性会话
+     * @returns {number} 清除的会话数量
+     */
+    clearAllStickySessions() {
+        const count = this.stickySessionMap.size;
+        this.stickySessionMap.clear();
+        this._log('info', `Cleared all ${count} sticky sessions`);
+        return count;
+    }
+
+    /**
+     * 销毁 ProviderPoolManager 实例，清理所有定时器和资源
+     * 在重新创建实例或关闭应用时调用
+     */
+    destroy() {
+        if (this.cleanupTimer) {
+            clearInterval(this.cleanupTimer);
+            this.cleanupTimer = null;
+        }
+        if (this.saveTimer) {
+            clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+        }
+        this.stickySessionMap.clear();
+        this._log('info', 'ProviderPoolManager destroyed');
     }
 
 }
