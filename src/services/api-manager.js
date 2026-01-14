@@ -60,15 +60,28 @@ export async function handleAPIRequests(method, path, req, res, currentConfig, a
 /**
  * Initialize API management features
  * @param {Object} services - The initialized services
+ * @param {Object} config - The configuration object
  * @returns {Function} - The heartbeat and token refresh function
  */
-export function initializeAPIManagement(services) {
+export function initializeAPIManagement(services, config = {}) {
+    // 启动定期健康检查
+    const healthCheckInterval = config.HEALTH_CHECK_INTERVAL || 120000; // 默认2分钟
+    if (healthCheckInterval > 0) {
+        setInterval(async () => {
+            try {
+                if (getProviderPoolManager()) {
+                    await getProviderPoolManager().performHealthChecks();
+                }
+            } catch (error) {
+                console.error('[Health Check Error] Periodic health check failed:', error.message);
+            }
+        }, healthCheckInterval);
+        console.log(`[Health Check] Periodic health check enabled with interval: ${healthCheckInterval}ms`);
+    }
+
     return async function heartbeatAndRefreshToken() {
         console.log(`[Heartbeat] Server is running. Current time: ${new Date().toLocaleString()}`, Object.keys(services));
         // 循环遍历所有已初始化的服务适配器，并尝试刷新令牌
-        // if (getProviderPoolManager()) {
-        //     await getProviderPoolManager().performHealthChecks(); // 定期执行健康检查
-        // }
         for (const providerKey in services) {
             const serviceAdapter = services[providerKey];
             try {
