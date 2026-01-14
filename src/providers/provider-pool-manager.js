@@ -3,6 +3,7 @@ import { getServiceAdapter } from './adapter.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
 import { getProviderModels } from './provider-models.js';
 import axios from 'axios';
+import { clearCacheEstimatorsForSession } from './claude/claude-kiro.js';
 
 /**
  * Manages a pool of API service providers, handling their health and selection.
@@ -44,10 +45,12 @@ export class ProviderPoolManager {
         this.modelFallbackMapping = options.globalConfig?.modelFallbackMapping || {};
 
         // 粘性会话配置
+        // 注意：TTL 设置为 5 分钟，与 Claude Prompt Caching 的 TTL 一致
+        // 这确保粘性会话和缓存推测器的生命周期同步，避免路由到缓存已过期的提供商
         this.stickySessionConfig = {
             enabled: options.stickySession?.enabled ?? false,
-            ttlMs: options.stickySession?.ttlMs ?? 30 * 60 * 1000,  // 默认30分钟过期
-            cleanupIntervalMs: options.stickySession?.cleanupIntervalMs ?? 5 * 60 * 1000,  // 清理间隔5分钟
+            ttlMs: options.stickySession?.ttlMs ?? 5 * 60 * 1000,  // 默认5分钟过期（与Claude缓存TTL一致）
+            cleanupIntervalMs: options.stickySession?.cleanupIntervalMs ?? 2 * 60 * 1000,  // 清理间隔2分钟（更频繁）
             maxSessions: options.stickySession?.maxSessions ?? 10000  // 最大会话数
         };
         this.stickySessionMap = new Map();
@@ -206,10 +209,17 @@ export class ProviderPoolManager {
         })[0];
 
         // ========== 创建粘性会话绑定 ==========
-        // 仅在非 fallback 场景下创建绑定，避免覆盖原有绑定
-        if (this.stickySessionConfig.enabled && sessionId && !isFromFallback) {
+        // 修复：Fallback 场景下也创建/更新粘性会话绑定
+        // 原因：如果主提供商不健康，用户应该绑定到新的健康提供商
+        // 这样可以保持缓存推测器的历史记录连续性
+        if (this.stickySessionConfig.enabled && sessionId) {
+            // 如果是 fallback 场景，记录日志说明正在更新绑定
+            if (isFromFallback) {
+                this._log('info', `Updating sticky session due to fallback: ${sessionId} -> provider: ${selected.config.uuid}`);
+            } else {
+                this._log('info', `Created sticky session for session: ${sessionId} -> provider: ${selected.config.uuid}`);
+            }
             this._createStickySession(sessionId, providerType, selected.config.uuid);
-            this._log('info', `Created sticky session for session: ${sessionId} -> provider: ${selected.config.uuid}`);
         }
 
         // 更新使用信息（除非明确跳过）
@@ -918,6 +928,8 @@ export class ProviderPoolManager {
         if (!provider) {
             this._log('warn', `Bound provider not found: ${session.providerUuid}`);
             this.stickySessionMap.delete(sessionId);
+            // 同步清理缓存推测器实例
+            clearCacheEstimatorsForSession(sessionId);
             return null;
         }
 
@@ -925,13 +937,18 @@ export class ProviderPoolManager {
         if (!provider.config.isHealthy || provider.config.isDisabled) {
             this._log('warn', `Bound provider unhealthy/disabled: ${session.providerUuid}, removing sticky session`);
             this.stickySessionMap.delete(sessionId);
+            // 同步清理缓存推测器实例
+            clearCacheEstimatorsForSession(sessionId);
             return null;  // 返回 null 触发 fallback 到 LRU
         }
 
         // 检查模型支持
         if (requestedModel && provider.config.notSupportedModels?.includes(requestedModel)) {
-            this._log('warn', `Bound provider doesn't support model: ${requestedModel}`);
-            // 不删除会话，只是本次请求 fallback
+            this._log('warn', `Bound provider doesn't support model: ${requestedModel}, will fallback and update binding`);
+            // 删除当前绑定，让 fallback 逻辑创建新的绑定到支持该模型的提供商
+            this.stickySessionMap.delete(sessionId);
+            // 同步清理缓存推测器实例（因为要切换到新提供商）
+            clearCacheEstimatorsForSession(sessionId);
             return null;
         }
 

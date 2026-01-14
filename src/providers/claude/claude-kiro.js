@@ -9,7 +9,7 @@ import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
-import { isRetryableNetworkError, MODEL_PROVIDER } from '../../utils/common.js';
+import { isRetryableNetworkError, MODEL_PROVIDER, extractSessionId } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { acquireFileLock } from '../../utils/file-lock.js';
 
@@ -227,6 +227,11 @@ function getImageFingerprint(base64) {
 
 /**
  * 简单的 LRU 缓存实现
+ *
+ * TTL 行为：滑动窗口（与 Claude API 一致）
+ * - Claude 官方文档："The cache is refreshed for no additional cost each time the cached content is used"
+ * - 每次访问都会重置 5 分钟倒计时
+ * - 只要持续使用，缓存就不会过期
  */
 class SimpleLRUCache {
     constructor(maxSize = 500, ttl = 300000) {
@@ -246,7 +251,7 @@ class SimpleLRUCache {
             return null;
         }
 
-        // LRU: 更新时间戳（比删除再插入更高效）
+        // 滑动 TTL: 更新时间戳，重置过期时间（与 Claude 行为一致）
         item.timestamp = now;
         return item;
     }
@@ -1094,93 +1099,221 @@ class KiroCacheEstimator {
     }
 }
 
-// 按账号隔离的缓存推测器实例 Map<accountId, { estimator, lastUsed }>
+// 按账号+模型+会话隔离的缓存推测器实例 Map<cacheKey, { estimator, lastUsed }>
 const accountCacheEstimators = new Map();
 
 // 账号缓存推测器的配置
 const ACCOUNT_CACHE_CONFIG = {
-    MAX_ACCOUNTS: 100,           // 最多缓存多少个账号的推测器
-    ACCOUNT_TTL: 3600000,        // 账号推测器的过期时间（1小时）
-    CLEANUP_INTERVAL: 300000     // 清理间隔（5分钟）
+    MAX_ESTIMATORS: 500,         // 最多缓存多少个推测器实例（账号*模型*会话）
+    ESTIMATOR_TTL: 600000,       // 推测器的过期时间（10分钟，比缓存TTL长）
+    CLEANUP_INTERVAL: 120000,    // 清理间隔（2分钟，更频繁的清理）
+    MEMORY_LIMIT_MB: 200,        // 缓存推测器组件的内存使用上限（MB）
+    MEMORY_LIMIT_RATIO: 0.3,     // 占总堆内存的最大比例（30%）
+    AGGRESSIVE_CLEANUP_THRESHOLD: 0.8  // 达到80%容量时触发激进清理
 };
 
 let lastCleanupTime = Date.now();
+let lastMemoryCheck = Date.now();
 
 /**
- * 清理过期的账号缓存推测器
+ * 获取当前进程的内存使用情况（MB）
  */
-function cleanupExpiredAccountEstimators() {
+function getMemoryUsageMB() {
+    const usage = process.memoryUsage();
+    return usage.heapUsed / 1024 / 1024;
+}
+
+/**
+ * 清理过期的缓存推测器
+ * @param {boolean} aggressive - 是否执行激进清理（忽略TTL，只保留最近使用的）
+ */
+function cleanupExpiredAccountEstimators(aggressive = false) {
     const now = Date.now();
 
     // 检查是否需要清理
-    if (now - lastCleanupTime < ACCOUNT_CACHE_CONFIG.CLEANUP_INTERVAL) {
+    if (!aggressive && now - lastCleanupTime < ACCOUNT_CACHE_CONFIG.CLEANUP_INTERVAL) {
         return;
     }
     lastCleanupTime = now;
 
     let cleanedCount = 0;
-    for (const [accountId, entry] of accountCacheEstimators.entries()) {
-        if (now - entry.lastUsed > ACCOUNT_CACHE_CONFIG.ACCOUNT_TTL) {
-            accountCacheEstimators.delete(accountId);
+    const entries = Array.from(accountCacheEstimators.entries());
+
+    if (aggressive) {
+        // 激进清理：按最后使用时间排序，只保留最近使用的一半
+        const keepCount = Math.floor(ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS / 2);
+        entries.sort((a, b) => b[1].lastUsed - a[1].lastUsed);
+
+        for (let i = keepCount; i < entries.length; i++) {
+            accountCacheEstimators.delete(entries[i][0]);
             cleanedCount++;
         }
-    }
 
-    // 如果超过最大数量，删除最久未使用的（使用迭代器避免创建大数组）
-    if (accountCacheEstimators.size > ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS) {
-        const toDeleteCount = accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ACCOUNTS;
-        // 找出最久未使用的条目
-        let oldestEntries = [];
-        for (const [accountId, entry] of accountCacheEstimators.entries()) {
-            oldestEntries.push({ accountId, lastUsed: entry.lastUsed });
-            // 只保留需要比较的数量，避免排序整个数组
-            if (oldestEntries.length > toDeleteCount * 2) {
-                oldestEntries.sort((a, b) => a.lastUsed - b.lastUsed);
-                oldestEntries = oldestEntries.slice(0, toDeleteCount);
+        console.log(`[Kiro CacheEstimator] Aggressive cleanup: removed ${cleanedCount} estimators, kept ${keepCount}`);
+    } else {
+        // 常规清理：删除过期的
+        for (const [cacheKey, entry] of entries) {
+            if (now - entry.lastUsed > ACCOUNT_CACHE_CONFIG.ESTIMATOR_TTL) {
+                accountCacheEstimators.delete(cacheKey);
+                cleanedCount++;
             }
         }
-        oldestEntries.sort((a, b) => a.lastUsed - b.lastUsed);
-        for (let i = 0; i < toDeleteCount && i < oldestEntries.length; i++) {
-            accountCacheEstimators.delete(oldestEntries[i].accountId);
-            cleanedCount++;
+
+        // 如果超过最大数量，删除最久未使用的
+        if (accountCacheEstimators.size > ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS) {
+            const toDeleteCount = accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS;
+            const remainingEntries = Array.from(accountCacheEstimators.entries());
+            remainingEntries.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+
+            for (let i = 0; i < toDeleteCount; i++) {
+                accountCacheEstimators.delete(remainingEntries[i][0]);
+                cleanedCount++;
+            }
+        }
+
+        if (cleanedCount > 0) {
+            console.log(`[Kiro CacheEstimator] Cleaned up ${cleanedCount} expired estimators, remaining: ${accountCacheEstimators.size}`);
         }
     }
 
-    if (cleanedCount > 0) {
-        console.log(`[Kiro CacheEstimator] Cleaned up ${cleanedCount} expired account estimators, remaining: ${accountCacheEstimators.size}`);
+    // 定期检查内存使用
+    if (now - lastMemoryCheck > 60000) { // 每分钟检查一次
+        lastMemoryCheck = now;
+        const memoryUsage = getMemoryUsageMB();
+
+        if (memoryUsage > ACCOUNT_CACHE_CONFIG.MEMORY_LIMIT_MB) {
+            console.warn(`[Kiro CacheEstimator] Memory usage (${memoryUsage.toFixed(2)}MB) exceeds limit (${ACCOUNT_CACHE_CONFIG.MEMORY_LIMIT_MB}MB), triggering aggressive cleanup`);
+            cleanupExpiredAccountEstimators(true);
+        }
+    }
+
+    // 检查是否需要触发激进清理
+    const utilizationRatio = accountCacheEstimators.size / ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS;
+    if (!aggressive && utilizationRatio > ACCOUNT_CACHE_CONFIG.AGGRESSIVE_CLEANUP_THRESHOLD) {
+        console.log(`[Kiro CacheEstimator] Utilization (${(utilizationRatio * 100).toFixed(1)}%) exceeds threshold, triggering aggressive cleanup`);
+        cleanupExpiredAccountEstimators(true);
     }
 }
 
 /**
- * 获取或创建指定账号的缓存推测器
+ * 生成缓存推测器的唯一键
  * @param {string} accountId - 账号唯一标识（uuid）
- * @param {Object} config - 配置选项
- * @returns {KiroCacheEstimator} 该账号的缓存推测器
+ * @param {string} model - 模型名称
+ * @param {string} sessionId - 会话ID（可选）
+ * @returns {string} 缓存键
  */
-function getCacheEstimatorForAccount(accountId, config = {}) {
+function generateCacheKey(accountId, model, sessionId = null) {
+    // 格式: account:model:session 或 account:model（如果没有sessionId）
+    const effectiveAccountId = accountId || `default_${process.pid}`;
+    const effectiveModel = model || 'default';
+
+    if (sessionId) {
+        return `${effectiveAccountId}:${effectiveModel}:${sessionId}`;
+    }
+    return `${effectiveAccountId}:${effectiveModel}`;
+}
+
+/**
+ * 获取或创建指定账号+模型+会话的缓存推测器
+ * @param {string} accountId - 账号唯一标识（uuid）
+ * @param {string} model - 模型名称
+ * @param {string} sessionId - 会话ID（可选，用于会话级别隔离）
+ * @param {Object} config - 配置选项
+ * @returns {KiroCacheEstimator} 该账号+模型+会话的缓存推测器
+ */
+function getCacheEstimatorForAccount(accountId, model = null, sessionId = null, config = {}) {
     // 先清理过期的推测器
     cleanupExpiredAccountEstimators();
 
-    // 如果没有提供 accountId，生成一个基于进程的唯一标识，避免不同服务共享缓存
-    const effectiveAccountId = accountId || `default_${process.pid}`;
+    // 生成缓存键：account:model:session
+    const cacheKey = generateCacheKey(accountId, model, sessionId);
 
-    let entry = accountCacheEstimators.get(effectiveAccountId);
+    let entry = accountCacheEstimators.get(cacheKey);
 
     if (!entry) {
         // 创建新的推测器
         const estimator = new KiroCacheEstimator(config);
         entry = {
             estimator,
-            lastUsed: Date.now()
+            lastUsed: Date.now(),
+            accountId: accountId || `default_${process.pid}`,
+            model: model || 'default',
+            sessionId: sessionId || null
         };
-        accountCacheEstimators.set(effectiveAccountId, entry);
-        console.log(`[Kiro] Cache estimator created for account: ${effectiveAccountId} (total accounts: ${accountCacheEstimators.size})`);
+        accountCacheEstimators.set(cacheKey, entry);
+
+        const sessionInfo = sessionId ? ` session: ${sessionId}` : '';
+        console.log(`[Kiro] Cache estimator created for account: ${entry.accountId}, model: ${entry.model}${sessionInfo} (total estimators: ${accountCacheEstimators.size})`);
     } else {
         // 更新最后使用时间
         entry.lastUsed = Date.now();
     }
 
     return entry.estimator;
+}
+
+/**
+ * 清理指定账号的所有缓存推测器实例
+ * 用于提供商不健康或被禁用时同步清理
+ * @param {string} accountId - 账号唯一标识（uuid）
+ * @returns {number} 清理的实例数量
+ */
+export function clearCacheEstimatorsForAccount(accountId) {
+    if (!accountId) return 0;
+
+    let cleanedCount = 0;
+    const keysToDelete = [];
+
+    // 查找所有属于该账号的缓存推测器
+    for (const [cacheKey, entry] of accountCacheEstimators.entries()) {
+        if (entry.accountId === accountId) {
+            keysToDelete.push(cacheKey);
+        }
+    }
+
+    // 删除找到的所有实例
+    for (const key of keysToDelete) {
+        accountCacheEstimators.delete(key);
+        cleanedCount++;
+    }
+
+    if (cleanedCount > 0) {
+        console.log(`[Kiro CacheEstimator] Cleared ${cleanedCount} estimator instances for account: ${accountId}`);
+    }
+
+    return cleanedCount;
+}
+
+/**
+ * 清理指定会话的缓存推测器实例
+ * 用于粘性会话被删除时同步清理
+ * @param {string} sessionId - 会话ID
+ * @returns {number} 清理的实例数量
+ */
+export function clearCacheEstimatorsForSession(sessionId) {
+    if (!sessionId) return 0;
+
+    let cleanedCount = 0;
+    const keysToDelete = [];
+
+    // 查找所有属于该会话的缓存推测器
+    for (const [cacheKey, entry] of accountCacheEstimators.entries()) {
+        if (entry.sessionId === sessionId) {
+            keysToDelete.push(cacheKey);
+        }
+    }
+
+    // 删除找到的所有实例
+    for (const key of keysToDelete) {
+        accountCacheEstimators.delete(key);
+        cleanedCount++;
+    }
+
+    if (cleanedCount > 0) {
+        console.log(`[Kiro CacheEstimator] Cleared ${cleanedCount} estimator instances for session: ${sessionId}`);
+    }
+
+    return cleanedCount;
 }
 
 const KIRO_CONSTANTS = {
@@ -2919,8 +3052,10 @@ async initializeAuth(forceRefresh = false) {
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
 
-            // 使用按账号隔离的缓存推测器估算缓存 token
-            const cacheEstimator = getCacheEstimatorForAccount(this.uuid);
+            // 使用按账号+模型+会话隔离的缓存推测器估算缓存 token
+            // 从 requestBody 中提取 sessionId（使用与粘性会话相同的提取逻辑）
+            const sessionId = this.extractSessionIdFromRequest(requestBody);
+            const cacheEstimator = getCacheEstimatorForAccount(this.uuid, model, sessionId);
             const cacheEstimation = cacheEstimator.estimateCacheTokens(requestBody, estimatedInputTokens, model);
 
             if (cacheEstimation._estimation?.estimated) {
@@ -3228,6 +3363,15 @@ async initializeAuth(forceRefresh = false) {
      * Calculate input tokens from request body using Claude's official tokenizer
      * Includes metadata tokens (role, type, cache_control, tool name/id, etc.)
      */
+    /**
+     * 从请求体中提取 sessionId（与粘性会话使用相同的提取逻辑）
+     * @param {Object} requestBody - 请求体
+     * @returns {string|null} sessionId 或 null
+     */
+    extractSessionIdFromRequest(requestBody) {
+        return extractSessionId(requestBody);
+    }
+
     estimateInputTokens(requestBody) {
         let totalTokens = 0;
 
