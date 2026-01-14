@@ -628,10 +628,17 @@ export class ProviderPoolManager {
             for (const providerStatus of this.providerStatus[providerType]) {
                 const providerConfig = providerStatus.config;
 
-                // Only attempt to health check unhealthy providers after a certain interval
-                if (!providerStatus.config.isHealthy && providerStatus.config.lastErrorTime &&
-                    (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < this.healthCheckInterval)) {
-                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent.`);
+                // 跳过健康的提供商（它们通过实际请求验证健康状态）
+                if (providerStatus.config.isHealthy) {
+                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Provider is healthy.`);
+                    continue;
+                }
+
+                // 不健康的提供商：如果距离上次错误 < 2分钟，跳过
+                const healthCheckRetryInterval = 120000; // 2分钟
+                if (providerStatus.config.lastErrorTime &&
+                    (now.getTime() - new Date(providerStatus.config.lastErrorTime).getTime() < healthCheckRetryInterval)) {
+                    this._log('debug', `Skipping health check for ${providerConfig.uuid} (${providerType}). Last error too recent (within 2 minutes).`);
                     continue;
                 }
 
