@@ -83,6 +83,60 @@ const MODEL_MIN_CACHE_TOKENS = {
     'default': 1024
 };
 
+// 预编译正则表达式 - 避免在热路径中重复编译
+const KIRO_REGEX = {
+    // JSON 开头识别，用于事件流解析
+    JSON_START: /\{"(?:content|name|followupPrompt|input|stop|contextUsagePercentage)":/g,
+    // 特殊字符规范化（用于哈希）- 箭头、乱码、控制字符
+    SPECIAL_CHARS: /[→⇒➜➔➙➛►▶︎▸⮕←⇐◄◀︎◂⬅↔⇔\uFFFD�]|[\u{E000}-\u{F8FF}]|[\x00-\x08\x0B\x0C\x0E-\x1F]/gu,
+    // 重复字符压缩
+    REPEAT_CHARS: /(->){2,}|(<->){2,}|(<-){2,}|\.{4,}|-{3,}|_{3,}|\s+$/gm,
+    // 右箭头类检测
+    RIGHT_ARROW: /[→⇒➜➔➙➛►▶︎▸⮕\uFFFD�]/,
+    // 左箭头类检测
+    LEFT_ARROW: /[←⇐◄◀︎◂⬅]/,
+    // 双向箭头检测
+    BIDIRECTIONAL_ARROW: /[↔⇔]/
+};
+
+// 预计算常见字符串的 token 数 - 避免在 estimateInputTokens() 中重复计算
+// 使用函数延迟初始化，因为 countTokens 可能在模块加载时尚未就绪
+let PRECOMPUTED_TOKENS = null;
+function getPrecomputedTokens() {
+    if (PRECOMPUTED_TOKENS === null) {
+        try {
+            PRECOMPUTED_TOKENS = {
+                // cache_control 常见值
+                cacheControl: {
+                    ephemeral: countTokens('{"type":"ephemeral"}'),  // ~3-4 tokens
+                },
+                // role 字段常见值
+                role: {
+                    user: countTokens('user'),
+                    assistant: countTokens('assistant'),
+                },
+                // content type 字段常见值
+                type: {
+                    text: countTokens('text'),
+                    thinking: countTokens('thinking'),
+                    tool_result: countTokens('tool_result'),
+                    tool_use: countTokens('tool_use'),
+                    image: countTokens('image'),
+                    document: countTokens('document'),
+                }
+            };
+        } catch (e) {
+            // 如果 tokenizer 初始化失败，使用估算值
+            PRECOMPUTED_TOKENS = {
+                cacheControl: { ephemeral: 4 },
+                role: { user: 1, assistant: 2 },
+                type: { text: 1, thinking: 2, tool_result: 2, tool_use: 2, image: 1, document: 2 }
+            };
+        }
+    }
+    return PRECOMPUTED_TOKENS;
+}
+
 // 块类型定义（保留用于未来扩展）
 // const BLOCK_TYPES = {
 //     TOOLS: 'tools',
@@ -746,43 +800,46 @@ class KiroCacheEstimator {
             }
         }
 
-        // 3. 遍历 messages，计算每个消息的 tokens，找到最后一个 cache_control 的位置
+        // 3. 遍历 messages - 优化：合并三次循环为一次
+        // 原来的三次遍历：1.找cache_control 2.计算tokens 3.计算哈希
+        // 现在合并为：一次遍历完成查找和token计算，仅对需要的消息计算哈希
         if (request.messages && request.messages.length > 0) {
-            // 查找最后一个带 cache_control 的消息索引
-            // Claude 缓存包含 cache_control 标记的消息本身
             let lastCacheControlIndex = -1;
-            for (let i = 0; i < request.messages.length; i++) {
+            const messagesLength = request.messages.length;
+            const allMessagesTokens = new Array(messagesLength);
+
+            // 单次遍历：同时查找 cache_control 和计算 tokens
+            for (let i = 0; i < messagesLength; i++) {
                 const msg = request.messages[i];
+
+                // 任务1: 找到最后一个 cache_control
                 if (this.messageHasCacheControl(msg)) {
                     lastCacheControlIndex = i;
                     cacheable.hasCacheControl = true;
                 }
-            }
 
-            // 计算每个消息的 token 数
-            for (let i = 0; i < request.messages.length; i++) {
-                const msg = request.messages[i];
+                // 任务2: 计算每个消息的 tokens
                 const contentText = this.contentToText(msg.content, msg.role);
-                const msgTokens = this.countTokensSimple(contentText);
-                cacheable.allMessagesTokens.push(msgTokens);
+                allMessagesTokens[i] = this.countTokensSimple(contentText);
             }
 
-            // 确定缓存前缀的范围
-            // Claude 缓存包含 cache_control 标记的消息本身
+            cacheable.allMessagesTokens = allMessagesTokens;
             cacheable.lastCacheBreakpoint = lastCacheControlIndex;
 
-            // 为缓存前缀内的每个消息计算哈希
-            if (cacheable.lastCacheBreakpoint >= 0) {
-                for (let i = 0; i <= cacheable.lastCacheBreakpoint; i++) {
+            // 任务3: 仅对缓存前缀内的消息计算哈希（已知 lastCacheControlIndex）
+            if (lastCacheControlIndex >= 0) {
+                let prefixTokens = 0;
+                for (let i = 0; i <= lastCacheControlIndex; i++) {
                     const msg = request.messages[i];
                     const hashInput = this.contentToTextForHash(msg.content, msg.role);
+                    const msgTokens = allMessagesTokens[i];
+                    prefixTokens += msgTokens;
+
                     cacheable.cachedMessages.push({
                         index: i,
                         role: msg.role,
-                        // 使用稳定字段计算哈希，排除易变的 tool_use_id/id/input
                         contentHash: this.simpleHash(hashInput),
-                        tokens: cacheable.allMessagesTokens[i],
-                        // 调试用：保存内容摘要（不存储完整内容以节省内存）
+                        tokens: msgTokens,
                         _debug: CACHE_ESTIMATION_CONFIG.DEBUG ? {
                             hashInputPreview: hashInput.substring(0, 200),
                             hashInputLength: hashInput.length,
@@ -791,8 +848,8 @@ class KiroCacheEstimator {
                                 : typeof msg.content
                         } : null
                     });
-                    cacheable.prefixMessagesTokens += cacheable.allMessagesTokens[i];
                 }
+                cacheable.prefixMessagesTokens = prefixTokens;
             }
         }
 
@@ -966,37 +1023,48 @@ class KiroCacheEstimator {
     /**
      * 规范化文本中的特殊字符（用于哈希计算）
      * 将各种箭头字符统一为标准形式，避免编码差异导致哈希不匹配
+     * 优化：使用预编译正则表达式，从 13 次替换减少到 2 次
      */
     normalizeTextForHash(text) {
         if (!text || typeof text !== 'string') return text;
 
-        // 规范化各种箭头字符为标准 ASCII 箭头
-        // 包括：→ (U+2192), ← (U+2190), ↔ (U+2194), ⇒ (U+21D2), ➜ (U+279C) 等
-        // 以及可能的乱码/损坏字符
-        return text
-            .replace(/[→⇒➜➔➙➛►▶︎▸⮕]/g, '->')  // 右箭头类
-            .replace(/[←⇐◄◀︎◂⬅]/g, '<-')        // 左箭头类
-            .replace(/[↔⇔]/g, '<->')              // 双向箭头
-            .replace(/[\uFFFD�]/g, '->')           // 替换乱码字符（常见于损坏的箭头）
-            .replace(/[\u{E000}-\u{F8FF}]/gu, '') // 移除私用区字符
-            .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // 移除控制字符
-            .replace(/(->){2,}/g, '->')            // 合并连续的 -> 为单个
-            .replace(/(<-){2,}/g, '<-')            // 合并连续的 <- 为单个
-            .replace(/(<->){2,}/g, '<->')          // 合并连续的 <-> 为单个
-            .replace(/\.{4,}/g, '...')             // 合并连续的点号为省略号
-            .replace(/-{3,}/g, '--')               // 合并连续的短横线
-            .replace(/_{3,}/g, '__')               // 合并连续的下划线
-            .replace(/\s+$/gm, '');                // 移除行尾空白
+        // 第一步：替换特殊字符（箭头、乱码、控制字符）
+        // 使用预编译的正则表达式
+        let result = text.replace(
+            KIRO_REGEX.SPECIAL_CHARS,
+            (char) => {
+                // 使用预编译的检测正则
+                if (KIRO_REGEX.RIGHT_ARROW.test(char)) return '->';
+                if (KIRO_REGEX.LEFT_ARROW.test(char)) return '<-';
+                if (KIRO_REGEX.BIDIRECTIONAL_ARROW.test(char)) return '<->';
+                return '';  // 私用区和控制字符：移除
+            }
+        );
+
+        // 第二步：处理重复字符和行尾空白
+        return result.replace(
+            KIRO_REGEX.REPEAT_CHARS,
+            (match) => {
+                if (match.startsWith('<->')) return '<->';
+                if (match.startsWith('->')) return '->';
+                if (match.startsWith('<-')) return '<-';
+                if (match.startsWith('.')) return '...';
+                if (match.startsWith('-')) return '--';
+                if (match.startsWith('_')) return '__';
+                return '';  // 行尾空白
+            }
+        );
     }
 
     /**
      * 内容转文本（仅稳定字段，用于哈希计算）
      * 排除易变字段：tool_use_id, id, input, cache_control
+     * 使用迭代而非递归，避免深层嵌套时的调用栈开销
      * @param {any} content - 消息内容
      * @param {string} role - 消息角色（可选）
      */
     contentToTextForHash(content, role = null) {
-        let parts = [];
+        const parts = [];
         if (role) parts.push(role);
 
         if (!content) return parts.join(' ');
@@ -1005,52 +1073,60 @@ class KiroCacheEstimator {
             return parts.join(' ');
         }
 
-        if (Array.isArray(content)) {
-            for (const c of content) {
-                if (typeof c === 'string') {
-                    parts.push(this.normalizeTextForHash(c));
-                    continue;
+        // 使用栈进行迭代处理，避免递归
+        const stack = [content];
+        const toolResultStrategy = this.config.toolResultStrategy || 'strict';
+
+        while (stack.length > 0) {
+            const item = stack.pop();
+
+            if (!item) continue;
+
+            if (typeof item === 'string') {
+                parts.push(this.normalizeTextForHash(item));
+                continue;
+            }
+
+            if (Array.isArray(item)) {
+                // 逆序压栈以保持原始顺序
+                for (let i = item.length - 1; i >= 0; i--) {
+                    stack.push(item[i]);
                 }
+                continue;
+            }
 
+            if (typeof item === 'object') {
                 // tool_result 特殊处理：根据策略决定如何计算哈希
-                if (c.type === 'tool_result') {
-                    const strategy = this.config.toolResultStrategy || 'strict';
-
+                if (item.type === 'tool_result') {
                     // ignore 模式：完全跳过 tool_result，不参与哈希计算
-                    if (strategy === 'ignore') {
+                    if (toolResultStrategy === 'ignore') {
                         continue;
                     }
 
-                    parts.push(c.type);
-                    if (c.name) parts.push(c.name);
+                    parts.push(item.type);
+                    if (item.name) parts.push(item.name);
 
-                    if (strategy === 'strict') {
-                        // 严格模式：包含完整内容
-                        if (c.content) parts.push(this.contentToTextForHash(c.content));
+                    if (toolResultStrategy === 'strict' && item.content) {
+                        // 严格模式：将 content 压入栈继续处理
+                        stack.push(item.content);
                     }
                     // name_only 模式：只添加了 type 和 name，不添加 content
                     continue;
                 }
 
-                // 只包含稳定字段
-                if (c.type) parts.push(c.type);
+                // 处理普通对象的稳定字段
+                if (item.type) parts.push(item.type);
                 // 排除 cache_control：这是动态添加的缓存控制标记，不是消息内容
-                if (c.text) parts.push(this.normalizeTextForHash(c.text));
-                if (c.thinking) parts.push(this.normalizeTextForHash(c.thinking));
-                if (c.name) parts.push(c.name);  // 工具名是稳定的
+                if (item.text) parts.push(this.normalizeTextForHash(item.text));
+                if (item.thinking) parts.push(this.normalizeTextForHash(item.thinking));
+                if (item.name) parts.push(item.name);  // 工具名是稳定的
                 // 排除: tool_use_id, id, input（这些每次请求都可能变化）
-                if (c.content) parts.push(this.contentToTextForHash(c.content));
-            }
-            return parts.join(' ');
-        }
 
-        // 对于非数组对象，只提取稳定字段
-        if (typeof content === 'object') {
-            let parts2 = [];
-            if (content.type) parts2.push(content.type);
-            if (content.text) parts2.push(this.normalizeTextForHash(content.text));
-            if (content.name) parts2.push(content.name);
-            return parts.concat(parts2).join(' ');
+                // 如果有 content 字段，压入栈继续处理
+                if (item.content) {
+                    stack.push(item.content);
+                }
+            }
         }
 
         return parts.join(' ');
@@ -1106,7 +1182,8 @@ const accountCacheEstimators = new Map();
 const ACCOUNT_CACHE_CONFIG = {
     MAX_ESTIMATORS: 500,         // 最多缓存多少个推测器实例（账号*模型*会话）
     ESTIMATOR_TTL: 600000,       // 推测器的过期时间（10分钟，比缓存TTL长）
-    CLEANUP_INTERVAL: 120000,    // 清理间隔（2分钟，更频繁的清理）
+    CLEANUP_INTERVAL: 300000,    // 清理间隔（5分钟，从2分钟增加以减少CPU开销）
+    CLEANUP_SAMPLE_RATE: 0.1,    // 10% 采样率触发清理检查
     MEMORY_LIMIT_MB: 200,        // 缓存推测器组件的内存使用上限（MB）
     MEMORY_LIMIT_RATIO: 0.3,     // 占总堆内存的最大比例（30%）
     AGGRESSIVE_CLEANUP_THRESHOLD: 0.8  // 达到80%容量时触发激进清理
@@ -1125,48 +1202,77 @@ function getMemoryUsageMB() {
 
 /**
  * 清理过期的缓存推测器
+ * 优化：使用采样检查减少 CPU 开销，避免不必要的数组创建
  * @param {boolean} aggressive - 是否执行激进清理（忽略TTL，只保留最近使用的）
  */
 function cleanupExpiredAccountEstimators(aggressive = false) {
     const now = Date.now();
 
-    // 检查是否需要清理
+    // 采样检查：只有 10% 的请求触发清理检查（非激进模式下）
+    if (!aggressive && Math.random() > ACCOUNT_CACHE_CONFIG.CLEANUP_SAMPLE_RATE) {
+        return;
+    }
+
+    // 检查是否需要清理（时间间隔检查）
     if (!aggressive && now - lastCleanupTime < ACCOUNT_CACHE_CONFIG.CLEANUP_INTERVAL) {
         return;
     }
     lastCleanupTime = now;
 
+    const mapSize = accountCacheEstimators.size;
+
+    // 快速检查：如果 Map 为空或很小，跳过清理
+    if (mapSize === 0) {
+        return;
+    }
+
     let cleanedCount = 0;
-    const entries = Array.from(accountCacheEstimators.entries());
 
     if (aggressive) {
         // 激进清理：按最后使用时间排序，只保留最近使用的一半
         const keepCount = Math.floor(ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS / 2);
-        entries.sort((a, b) => b[1].lastUsed - a[1].lastUsed);
 
-        for (let i = keepCount; i < entries.length; i++) {
-            accountCacheEstimators.delete(entries[i][0]);
-            cleanedCount++;
-        }
+        if (mapSize > keepCount) {
+            // 只在需要删除时才创建数组并排序
+            const entries = Array.from(accountCacheEstimators.entries());
+            entries.sort((a, b) => b[1].lastUsed - a[1].lastUsed);
 
-        console.log(`[Kiro CacheEstimator] Aggressive cleanup: removed ${cleanedCount} estimators, kept ${keepCount}`);
-    } else {
-        // 常规清理：删除过期的
-        for (const [cacheKey, entry] of entries) {
-            if (now - entry.lastUsed > ACCOUNT_CACHE_CONFIG.ESTIMATOR_TTL) {
-                accountCacheEstimators.delete(cacheKey);
+            for (let i = keepCount; i < entries.length; i++) {
+                accountCacheEstimators.delete(entries[i][0]);
                 cleanedCount++;
             }
         }
 
+        if (cleanedCount > 0) {
+            console.log(`[Kiro CacheEstimator] Aggressive cleanup: removed ${cleanedCount} estimators, kept ${accountCacheEstimators.size}`);
+        }
+    } else {
+        // 常规清理：直接遍历 Map 删除过期的（不创建中间数组）
+        const expiredKeys = [];
+        const ttl = ACCOUNT_CACHE_CONFIG.ESTIMATOR_TTL;
+
+        for (const [cacheKey, entry] of accountCacheEstimators) {
+            if (now - entry.lastUsed > ttl) {
+                expiredKeys.push(cacheKey);
+            }
+        }
+
+        // 批量删除过期项
+        for (const key of expiredKeys) {
+            accountCacheEstimators.delete(key);
+            cleanedCount++;
+        }
+
         // 如果超过最大数量，删除最久未使用的
-        if (accountCacheEstimators.size > ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS) {
-            const toDeleteCount = accountCacheEstimators.size - ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS;
-            const remainingEntries = Array.from(accountCacheEstimators.entries());
-            remainingEntries.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+        const currentSize = accountCacheEstimators.size;
+        if (currentSize > ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS) {
+            const toDeleteCount = currentSize - ACCOUNT_CACHE_CONFIG.MAX_ESTIMATORS;
+            // 只在需要 LRU 淘汰时才创建数组并排序
+            const entries = Array.from(accountCacheEstimators.entries());
+            entries.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
 
             for (let i = 0; i < toDeleteCount; i++) {
-                accountCacheEstimators.delete(remainingEntries[i][0]);
+                accountCacheEstimators.delete(entries[i][0]);
                 cleanedCount++;
             }
         }
@@ -1638,6 +1744,13 @@ export class KiroApiService {
         this.modelName = KIRO_CONSTANTS.DEFAULT_MODEL_NAME;
         this.axiosInstance = null; // Initialize later in async method
         this.axiosSocialRefreshInstance = null;
+
+        // CPU 优化：状态追踪变量
+        this._lastExpiryNearState = null;  // 追踪过期状态变化，避免重复日志
+        this._refreshPromise = null;        // 单飞锁：防止并发刷新
+        this._lastRefreshTime = 0;          // 上次刷新时间
+        this._refreshCooldownMs = 30000;    // 刷新冷却时间（30秒）
+        this._tokenCountCache = new SimpleLRUCache(2000, 600000);  // Token 计数缓存
     }
  
     async initialize() {
@@ -1699,11 +1812,39 @@ export class KiroApiService {
     }
 
 async initializeAuth(forceRefresh = false) {
+    // 快速短路：已有 token 且不是强制刷新
     if (this.accessToken && !forceRefresh) {
         console.debug('[Kiro Auth] Access token already available and not forced refresh.');
         return;
     }
 
+    // 单飞锁：如果已有刷新在进行中，等待它完成
+    if (this._refreshPromise) {
+        console.debug('[Kiro Auth] Refresh already in progress, waiting...');
+        return this._refreshPromise;
+    }
+
+    // 冷却检查：30秒内不重复刷新（仅对 forceRefresh 生效）
+    const now = Date.now();
+    if (forceRefresh && this._lastRefreshTime && (now - this._lastRefreshTime < this._refreshCooldownMs)) {
+        console.debug(`[Kiro Auth] Refresh cooldown active, skipping. Last refresh: ${now - this._lastRefreshTime}ms ago`);
+        return;
+    }
+
+    // 包装刷新逻辑为 Promise，实现单飞
+    this._refreshPromise = this._doRefresh(forceRefresh).finally(() => {
+        this._refreshPromise = null;
+        this._lastRefreshTime = Date.now();
+    });
+
+    return this._refreshPromise;
+}
+
+/**
+ * 实际执行 token 刷新的内部方法
+ * @private
+ */
+async _doRefresh(forceRefresh = false) {
     // Helper to load credentials from a file
     const loadCredentialsFromFile = async (filePath) => {
         try {
@@ -1764,9 +1905,9 @@ async initializeAuth(forceRefresh = false) {
         const targetFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
         const dirPath = path.dirname(targetFilePath);
         const targetFileName = path.basename(targetFilePath);
-        
+
         console.debug(`[Kiro Auth] Attempting to load credentials from directory: ${dirPath}`);
-        
+
         try {
             // 首先尝试读取目标文件
             const targetCredentials = await loadCredentialsFromFile(targetFilePath);
@@ -1774,7 +1915,7 @@ async initializeAuth(forceRefresh = false) {
                 Object.assign(mergedCredentials, targetCredentials);
                 console.info(`[Kiro Auth] Successfully loaded OAuth credentials from ${targetFilePath}`);
             }
-            
+
             // 然后读取目录下的其他 JSON 文件(排除目标文件本身)
             const files = await fs.readdir(dirPath);
             for (const file of files) {
@@ -1852,6 +1993,8 @@ async initializeAuth(forceRefresh = false) {
                 const expiresIn = response.data.expiresIn;
                 const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
                 this.expiresAt = expiresAt;
+                // 刷新成功后重置过期状态，确保下次检查能正确记录状态变化
+                this._lastExpiryNearState = false;
                 console.info('[Kiro Auth] Access token refreshed successfully');
 
                 // Update the token file - use specified path if configured, otherwise use default
@@ -2661,63 +2804,48 @@ async initializeAuth(forceRefresh = false) {
     /**
      * 解析 AWS Event Stream 格式，提取所有完整的 JSON 事件
      * 返回 { events: 解析出的事件数组, remaining: 未处理完的缓冲区 }
+     * 优化：使用单一正则替代 6 次 indexOf 调用
      */
     parseAwsEventStreamBuffer(buffer) {
         const events = [];
         let remaining = buffer;
-        let searchStart = 0;
         const MAX_ITERATIONS = 1000; // 防止无限循环
         let iterations = 0;
 
-        while (iterations++ < MAX_ITERATIONS) {
-            // 查找真正的 JSON payload 起始位置
-            // AWS Event Stream 包含二进制头部，我们只搜索有效的 JSON 模式
-            // Kiro 返回格式: {"content":"..."} 或 {"name":"xxx","toolUseId":"xxx",...} 或 {"followupPrompt":"..."}
-            
-            // 搜索所有可能的 JSON payload 开头模式
-            // Kiro 返回的 toolUse 可能分多个事件：
-            // 1. {"name":"xxx","toolUseId":"xxx"} - 开始
-            // 2. {"input":"..."} - input 数据（可能多次）
-            // 3. {"stop":true} - 结束
-            // 4. {"contextUsagePercentage":...} - 上下文使用百分比（最后一条消息）
-            const contentStart = remaining.indexOf('{"content":', searchStart);
-            const nameStart = remaining.indexOf('{"name":', searchStart);
-            const followupStart = remaining.indexOf('{"followupPrompt":', searchStart);
-            const inputStart = remaining.indexOf('{"input":', searchStart);
-            const stopStart = remaining.indexOf('{"stop":', searchStart);
-            const contextUsageStart = remaining.indexOf('{"contextUsagePercentage":', searchStart);
-            
-            // 找到最早出现的有效 JSON 模式
-            const candidates = [contentStart, nameStart, followupStart, inputStart, stopStart, contextUsageStart].filter(pos => pos >= 0);
-            if (candidates.length === 0) break;
-            
-            const jsonStart = Math.min(...candidates);
-            if (jsonStart < 0) break;
-            
+        // 使用预编译的正则表达式（模块级别定义）
+        const jsonStartPattern = KIRO_REGEX.JSON_START;
+        jsonStartPattern.lastIndex = 0;
+
+        let match;
+        let lastProcessedEnd = 0;
+
+        while (iterations++ < MAX_ITERATIONS && (match = jsonStartPattern.exec(remaining)) !== null) {
+            const jsonStart = match.index;
+
             // 正确处理嵌套的 {} - 使用括号计数法
             let braceCount = 0;
             let jsonEnd = -1;
             let inString = false;
             let escapeNext = false;
-            
+
             for (let i = jsonStart; i < remaining.length; i++) {
                 const char = remaining[i];
-                
+
                 if (escapeNext) {
                     escapeNext = false;
                     continue;
                 }
-                
+
                 if (char === '\\') {
                     escapeNext = true;
                     continue;
                 }
-                
+
                 if (char === '"') {
                     inString = !inString;
                     continue;
                 }
-                
+
                 if (!inString) {
                     if (char === '{') {
                         braceCount++;
@@ -2730,28 +2858,24 @@ async initializeAuth(forceRefresh = false) {
                     }
                 }
             }
-            
+
             if (jsonEnd < 0) {
                 // 不完整的 JSON，保留在缓冲区等待更多数据
                 remaining = remaining.substring(jsonStart);
-                break;
+                return { events, remaining };
             }
-            
+
             const jsonStr = remaining.substring(jsonStart, jsonEnd + 1);
             try {
                 const parsed = JSON.parse(jsonStr);
                 // 处理 content 事件
                 if (parsed.content !== undefined && !parsed.followupPrompt) {
-                    // 处理转义字符
-                    let decodedContent = parsed.content;
-                    // 无须处理转义的换行符，原来要处理是因为智能体返回的 content 需要通过换行符切割不同的json
-                    // decodedContent = decodedContent.replace(/(?<!\\)\\n/g, '\n');
-                    events.push({ type: 'content', data: decodedContent });
+                    events.push({ type: 'content', data: parsed.content });
                 }
                 // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
                 else if (parsed.name && parsed.toolUseId) {
-                    events.push({ 
-                        type: 'toolUse', 
+                    events.push({
+                        type: 'toolUse',
                         data: {
                             name: parsed.name,
                             toolUseId: parsed.toolUseId,
@@ -2790,19 +2914,16 @@ async initializeAuth(forceRefresh = false) {
             } catch (e) {
                 // JSON 解析失败，跳过这个位置继续搜索
             }
-            
-            searchStart = jsonEnd + 1;
-            if (searchStart >= remaining.length) {
-                remaining = '';
-                break;
-            }
+
+            lastProcessedEnd = jsonEnd + 1;
+            jsonStartPattern.lastIndex = lastProcessedEnd;
         }
-        
-        // 如果 searchStart 有进展，截取剩余部分
-        if (searchStart > 0 && remaining.length > 0) {
-            remaining = remaining.substring(searchStart);
+
+        // 如果有进展，截取剩余部分
+        if (lastProcessedEnd > 0) {
+            remaining = remaining.substring(lastProcessedEnd);
         }
-        
+
         return { events, remaining };
     }
 
@@ -2838,21 +2959,63 @@ async initializeAuth(forceRefresh = false) {
                 });
 
                 stream = response.data;
-                let buffer = '';
+                // 优化：使用数组累积而非字符串拼接，避免 O(n²) 复杂度
+                const chunks = [];
+                let totalSize = 0;
                 let lastContentEvent = null;
                 const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+                const CHUNK_BATCH_SIZE = 50;  // 每 50 个 chunk 合并一次
 
                 for await (const chunk of stream) {
-                    buffer += chunk.toString();
+                    const chunkStr = chunk.toString();
+                    chunks.push(chunkStr);
+                    totalSize += chunkStr.length;
 
-                    if (buffer.length > MAX_BUFFER_SIZE) {
+                    if (totalSize > MAX_BUFFER_SIZE) {
                         console.error('[Kiro] Stream buffer overflow, clearing buffer');
-                        buffer = '';
+                        chunks.length = 0;
+                        totalSize = 0;
                         continue;
                     }
 
+                    // 定期合并缓冲区，避免数组过大
+                    if (chunks.length >= CHUNK_BATCH_SIZE) {
+                        const buffer = chunks.join('');
+                        const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
+
+                        // 重置 chunks 数组，保留剩余未处理的数据
+                        chunks.length = 0;
+                        if (remaining) {
+                            chunks.push(remaining);
+                            totalSize = remaining.length;
+                        } else {
+                            totalSize = 0;
+                        }
+
+                        for (const event of events) {
+                            if (event.type === 'content' && event.data) {
+                                if (lastContentEvent === event.data) {
+                                    continue;
+                                }
+                                lastContentEvent = event.data;
+                                yield { type: 'content', content: event.data };
+                            } else if (event.type === 'toolUse') {
+                                yield { type: 'toolUse', toolUse: event.data };
+                            } else if (event.type === 'toolUseInput') {
+                                yield { type: 'to', input: event.data.input };
+                            } else if (event.type === 'toolUseStop') {
+                                yield { type: 'toolUseStop', stop: event.data.stop };
+                            } else if (event.type === 'contextUsage') {
+                                yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
+                            }
+                        }
+                    }
+                }
+
+                // 处理剩余的 chunks
+                if (chunks.length > 0) {
+                    const buffer = chunks.join('');
                     const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
-                    buffer = remaining;
 
                     for (const event of events) {
                         if (event.type === 'content' && event.data) {
@@ -3347,15 +3510,39 @@ async initializeAuth(forceRefresh = false) {
 
     /**
      * Count tokens for a given text using Claude's official tokenizer
+     * Optimized: Uses LRU cache for long texts to avoid repeated tokenization
      */
     countTextTokens(text) {
         if (!text) return 0;
+
+        // 对于短文本直接计算（缓存开销不值得）
+        if (text.length < 100) {
+            try {
+                return countTokens(text);
+            } catch (error) {
+                return Math.ceil(text.length / 4);
+            }
+        }
+
+        // 长文本使用缓存
+        // 使用文本长度+前后100字符作为快速缓存键（避免完整哈希计算）
+        const cacheKey = `${text.length}:${text.slice(0, 100)}:${text.slice(-100)}`;
+
+        const cached = this._tokenCountCache.get(cacheKey);
+        if (cached !== undefined) {
+            return cached;
+        }
+
         try {
-            return countTokens(text);
+            const count = countTokens(text);
+            this._tokenCountCache.set(cacheKey, count);
+            return count;
         } catch (error) {
             // Fallback to estimation if tokenizer fails
             console.warn('[Kiro] Tokenizer error, falling back to estimation:', error.message);
-            return Math.ceil((text || '').length / 4);
+            const estimate = Math.ceil(text.length / 4);
+            this._tokenCountCache.set(cacheKey, estimate);
+            return estimate;
         }
     }
 
@@ -3374,6 +3561,26 @@ async initializeAuth(forceRefresh = false) {
 
     estimateInputTokens(requestBody) {
         let totalTokens = 0;
+        const precomputed = getPrecomputedTokens();
+
+        // 辅助函数：获取 cache_control 的 token 数（使用预计算值或回退到计算）
+        const getCacheControlTokens = (cacheControl) => {
+            if (cacheControl?.type === 'ephemeral') {
+                return precomputed.cacheControl.ephemeral;
+            }
+            // 非常见值才调用 JSON.stringify
+            return this.countTextTokens(JSON.stringify(cacheControl));
+        };
+
+        // 辅助函数：获取 role 的 token 数（使用预计算值或回退到计算）
+        const getRoleTokens = (role) => {
+            return precomputed.role[role] ?? this.countTextTokens(role);
+        };
+
+        // 辅助函数：获取 type 的 token 数（使用预计算值或回退到计算）
+        const getTypeTokens = (type) => {
+            return precomputed.type[type] ?? this.countTextTokens(type);
+        };
 
         // Count system prompt tokens
         if (requestBody.system) {
@@ -3383,7 +3590,7 @@ async initializeAuth(forceRefresh = false) {
             if (Array.isArray(requestBody.system)) {
                 for (const part of requestBody.system) {
                     if (part.cache_control) {
-                        totalTokens += this.countTextTokens(JSON.stringify(part.cache_control));
+                        totalTokens += getCacheControlTokens(part.cache_control);
                     }
                 }
             }
@@ -3399,22 +3606,22 @@ async initializeAuth(forceRefresh = false) {
         // Count all messages tokens
         if (requestBody.messages && Array.isArray(requestBody.messages)) {
             for (const message of requestBody.messages) {
-                // Count role field tokens
+                // Count role field tokens (使用预计算值)
                 if (message.role) {
-                    totalTokens += this.countTextTokens(message.role);
+                    totalTokens += getRoleTokens(message.role);
                 }
 
                 if (message.content) {
                     if (Array.isArray(message.content)) {
                         for (const part of message.content) {
-                            // Count type field tokens
+                            // Count type field tokens (使用预计算值)
                             if (part.type) {
-                                totalTokens += this.countTextTokens(part.type);
+                                totalTokens += getTypeTokens(part.type);
                             }
 
-                            // Count cache_control tokens
+                            // Count cache_control tokens (使用预计算值)
                             if (part.cache_control) {
-                                totalTokens += this.countTextTokens(JSON.stringify(part.cache_control));
+                                totalTokens += getCacheControlTokens(part.cache_control);
                             }
 
                             if (part.type === 'text' && part.text) {
@@ -3657,17 +3864,25 @@ async initializeAuth(forceRefresh = false) {
     }
 
     /**
-     * Checks if the given expiresAt timestamp is within 10 minutes from now.
-     * @returns {boolean} - True if expiresAt is less than 10 minutes from now, false otherwise.
+     * Checks if the given expiresAt timestamp is within configured minutes from now.
+     * Optimized: Only logs when state changes to reduce CPU overhead.
+     * @returns {boolean} - True if expiresAt is less than configured minutes from now, false otherwise.
      */
     isExpiryDateNear() {
         try {
-            const expirationTime = new Date(this.expiresAt);
-            const currentTime = new Date();
+            const expirationTime = new Date(this.expiresAt).getTime();
+            const currentTime = Date.now();  // 使用 Date.now() 更高效
             const cronNearMinutesInMillis = (this.config.CRON_NEAR_MINUTES || 10) * 60 * 1000;
-            const thresholdTime = new Date(currentTime.getTime() + cronNearMinutesInMillis);
-            console.log(`[Kiro] Expiry date: ${expirationTime.getTime()}, Current time: ${currentTime.getTime()}, ${this.config.CRON_NEAR_MINUTES || 10} minutes from now: ${thresholdTime.getTime()}`);
-            return expirationTime.getTime() <= thresholdTime.getTime();
+            const isNear = expirationTime <= currentTime + cronNearMinutesInMillis;
+
+            // 仅在状态变化时打印日志，避免高 QPS 时的 CPU 开销
+            if (isNear !== this._lastExpiryNearState) {
+                this._lastExpiryNearState = isNear;
+                if (isNear) {
+                    console.log(`[Kiro] Token approaching expiry, will refresh. Expires at: ${new Date(expirationTime).toISOString()}`);
+                }
+            }
+            return isNear;
         } catch (error) {
             console.error(`[Kiro] Error checking expiry date: ${this.expiresAt}, Error: ${error.message}`);
             return false; // Treat as expired if parsing fails
