@@ -144,11 +144,41 @@ export function getRequestBody(req) {
  * @returns {string|null} session ID 或 null
  */
 export function extractSessionId(requestBody) {
-    const userId = requestBody?.metadata?.user_id;
-    if (!userId) return null;
+    if (!requestBody || typeof requestBody !== 'object') return null;
 
-    const match = userId.match(/session_([a-f0-9-]+)/i);
-    return match ? match[1] : null;
+    // 1) Claude / Claude Code: metadata.user_id 中包含 session_<uuid>
+    const userId = requestBody?.metadata?.user_id;
+    if (typeof userId === 'string' && userId.trim()) {
+        const match = userId.match(/session_([a-f0-9-]+)/i);
+        if (match) return match[1];
+    }
+
+    // 2) 显式字段（推荐）：metadata.session_id / metadata.sessionId
+    const metadataSessionId = requestBody?.metadata?.session_id ?? requestBody?.metadata?.sessionId;
+    if (typeof metadataSessionId === 'string' && metadataSessionId.trim()) {
+        return metadataSessionId.trim();
+    }
+
+    // 3) 显式字段：session_id / sessionId
+    const rootSessionId = requestBody?.session_id ?? requestBody?.sessionId;
+    if (typeof rootSessionId === 'string' && rootSessionId.trim()) {
+        return rootSessionId.trim();
+    }
+
+    // 4) OpenAI: user 字段（仅在其看起来像 session 标识时使用）
+    const openaiUser = requestBody?.user;
+    if (typeof openaiUser === 'string' && openaiUser.trim()) {
+        const trimmed = openaiUser.trim();
+        const sessionMatch = trimmed.match(/session_([a-f0-9-]+)/i);
+        if (sessionMatch) return sessionMatch[1];
+
+        // UUID 格式
+        if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(trimmed)) {
+            return trimmed;
+        }
+    }
+
+    return null;
 }
 
 export async function logConversation(type, content, logMode, logFilename) {

@@ -253,6 +253,7 @@ export class OpenAIConverter extends BaseConverter {
             max_tokens: checkAndAssignOrDefault(openaiRequest.max_tokens, CLAUDE_DEFAULT_MAX_TOKENS),
             temperature: checkAndAssignOrDefault(openaiRequest.temperature, CLAUDE_DEFAULT_TEMPERATURE),
             top_p: checkAndAssignOrDefault(openaiRequest.top_p, CLAUDE_DEFAULT_TOP_P),
+            metadata: openaiRequest.metadata,  // 保留 metadata 用于 sessionId 提取
         };
 
         if (systemInstruction) {

@@ -6,6 +6,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
+import { LRUCache } from 'lru-cache';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
@@ -52,6 +53,13 @@ const CACHE_ESTIMATION_CONFIG = {
     // 乐观匹配模式：允许跳过中间不匹配的消息继续匹配后续消息（默认开启）
     // 注意：这不反映 Claude 实际缓存行为，仅用于乐观估算
     OPTIMISTIC_MATCHING: process.env.KIRO_OPTIMISTIC_CACHE !== 'false',
+};
+
+// 流式解析配置（TTFB 优化）
+const STREAM_PARSE_CONFIG = {
+    BATCH_SIZE: parseInt(process.env.KIRO_STREAM_PARSE_BATCH_SIZE, 10) || 50,
+    MAX_DELAY_MS: parseInt(process.env.KIRO_STREAM_PARSE_MAX_DELAY_MS, 10) || 500,
+    PERF_DEBUG: process.env.KIRO_PERF_DEBUG !== 'false',
 };
 
 // 全局日志级别控制
@@ -280,68 +288,40 @@ function getImageFingerprint(base64) {
 // }
 
 /**
- * 简单的 LRU 缓存实现
+ * 高效 LRU 缓存包装器（基于 lru-cache 库）
  *
  * TTL 行为：滑动窗口（与 Claude API 一致）
  * - Claude 官方文档："The cache is refreshed for no additional cost each time the cached content is used"
  * - 每次访问都会重置 5 分钟倒计时
  * - 只要持续使用，缓存就不会过期
+ *
+ * 相比原 SimpleLRUCache 的优化：
+ * - 使用双向链表 + Map，O(1) 复杂度
+ * - 自动定期清理过期条目
+ * - 更好的内存管理
  */
 class SimpleLRUCache {
     constructor(maxSize = 500, ttl = 300000) {
-        this.maxSize = maxSize;
-        this.ttl = ttl;
-        this.cache = new Map();
-    }
-
-    get(key) {
-        const item = this.cache.get(key);
-        if (!item) return null;
-
-        // 检查是否过期
-        const now = Date.now();
-        if (now - item.timestamp > this.ttl) {
-            this.cache.delete(key);
-            return null;
-        }
-
-        // 滑动 TTL: 更新时间戳，重置过期时间（与 Claude 行为一致）
-        item.timestamp = now;
-        return item;
-    }
-
-    set(key, value) {
-        // 如果已存在，直接更新（避免删除再插入）
-        const existing = this.cache.get(key);
-        if (existing) {
-            Object.assign(existing, value);
-            existing.timestamp = Date.now();
-            return;
-        }
-
-        // 检查容量
-        if (this.cache.size >= this.maxSize) {
-            // 删除最旧的条目
-            const firstKey = this.cache.keys().next().value;
-            this.cache.delete(firstKey);
-        }
-
-        this.cache.set(key, {
-            ...value,
-            timestamp: Date.now()
+        this.cache = new LRUCache({
+            max: maxSize,
+            ttl: ttl,
+            updateAgeOnGet: true,  // 滑动 TTL：访问时重置过期时间
+            updateAgeOnHas: false, // has() 不更新 TTL
+            allowStale: false,     // 不返回过期条目
         });
     }
 
+    get(key) {
+        const value = this.cache.get(key);
+        return value !== undefined ? value : null;
+    }
+
+    set(key, value) {
+        this.cache.set(key, value);
+    }
+
     has(key) {
-        // 不调用 get() 以避免改变 LRU 顺序
-        const item = this.cache.get(key);
-        if (!item) return false;
-        // 检查是否过期
-        if (Date.now() - item.timestamp > this.ttl) {
-            this.cache.delete(key);
-            return false;
-        }
-        return true;
+        return this.cache.has(key);
     }
 
     getValue(key) {
@@ -1750,7 +1730,7 @@ export class KiroApiService {
         this._refreshPromise = null;        // 单飞锁：防止并发刷新
         this._lastRefreshTime = 0;          // 上次刷新时间
         this._refreshCooldownMs = 30000;    // 刷新冷却时间（30秒）
-        this._tokenCountCache = new SimpleLRUCache(2000, 600000);  // Token 计数缓存
+        this._tokenCountCache = new SimpleLRUCache(500, 300000);  // Token 计数缓存：500条/5分钟
     }
  
     async initialize() {
@@ -1769,14 +1749,14 @@ export class KiroApiService {
         // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
         const httpAgent = new http.Agent({
             keepAlive: true,
-            maxSockets: 100,        // 每个主机最多 10 个连接
-            maxFreeSockets: 5,     // 最多保留 5 个空闲连接
+            maxSockets: 20,         // 每个主机最多 20 个连接
+            maxFreeSockets: 3,      // 最多保留 3 个空闲连接
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
         });
         const httpsAgent = new https.Agent({
             keepAlive: true,
-            maxSockets: 100,
-            maxFreeSockets: 5,
+            maxSockets: 20,
+            maxFreeSockets: 3,
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
         });
         
@@ -1791,7 +1771,6 @@ export class KiroApiService {
                 'x-amzn-kiro-agent-mode': 'vibe',
                 'x-amz-user-agent': `aws-sdk-js/1.0.0 KiroIDE-${kiroVersion}-${machineId}`,
                 'user-agent': `aws-sdk-js/1.0.0 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-${kiroVersion}-${machineId}`,
-                'Connection': 'close'
             },
         };
         
@@ -2673,8 +2652,28 @@ async _doRefresh(forceRefresh = false) {
     
             // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
             if (status === 403) {
-                console.log('[Kiro] Received 403. Marking credential as unhealthy...');
-                this._markCredentialUnhealthy('403 Forbidden', error);
+                console.log('[Kiro] Received 403. Marking credential as need refresh...');
+
+                // 检查是否为 temporarily suspended 错误
+                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+
+                if (isSuspended) {
+                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                    console.log('[Kiro] Account temporarily suspended. Marking as unhealthy without UUID refresh...');
+                    this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended', error);
+                } else {
+                    // 其他 403 错误：先刷新 UUID，然后标记需要刷新
+                    const newUuid = this._refreshUuid();
+                    if (newUuid) {
+                        console.log(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+                        this.uuid = newUuid;
+                    }
+                    this._markCredentialNeedRefresh('403 Forbidden', error);
+                }
+
+                // Mark error for credential switch without recording error count
+                error.shouldSwitchCredential = true;
+                error.skipErrorCount = true;
                 throw error;
             }
             
@@ -2713,6 +2712,57 @@ async _doRefresh(forceRefresh = false) {
      * @param {string} reason - The reason for marking unhealthy
      * @param {Error} [error] - Optional error object to attach the marker to
      * @returns {boolean} - Whether the credential was successfully marked as unhealthy
+     * @private
+     */
+    /**
+     * 刷新 UUID（生成新的机器码标识）
+     * @returns {string|null} 新的 UUID 或 null
+     * @private
+     */
+    _refreshUuid() {
+        const poolManager = getProviderPoolManager();
+        if (poolManager && this.uuid) {
+            const newUuid = poolManager.refreshProviderUuid(MODEL_PROVIDER.KIRO_API, {
+                uuid: this.uuid
+            });
+            return newUuid;
+        } else {
+            console.warn(`[Kiro] Cannot refresh UUID: poolManager=${!!poolManager}, uuid=${this.uuid}`);
+            return null;
+        }
+    }
+
+    /**
+     * 标记凭证需要刷新（进入刷新队列）
+     * @param {string} reason - 标记原因
+     * @param {Error} [error] - 可选的错误对象
+     * @returns {boolean} - 是否成功标记
+     * @private
+     */
+    _markCredentialNeedRefresh(reason, error = null) {
+        const poolManager = getProviderPoolManager();
+        if (poolManager && this.uuid) {
+            console.log(`[Kiro] Marking credential ${this.uuid} as needs refresh. Reason: ${reason}`);
+            // 使用新的 markProviderNeedRefresh 方法代替 markProviderUnhealthyImmediately
+            poolManager.markProviderNeedRefresh(MODEL_PROVIDER.KIRO_API, {
+                uuid: this.uuid
+            });
+            // Attach marker to error object to prevent duplicate marking in upper layers
+            if (error) {
+                error.credentialMarkedUnhealthy = true;
+            }
+            return true;
+        } else {
+            console.warn(`[Kiro] Cannot mark credential as needs refresh: poolManager=${!!poolManager}, uuid=${this.uuid}`);
+            return false;
+        }
+    }
+
+    /**
+     * 标记凭证为不健康（立即标记）
+     * @param {string} reason - 标记原因
+     * @param {Error} [error] - 可选的错误对象
+     * @returns {boolean} - 是否成功标记
      * @private
      */
     _markCredentialUnhealthy(reason, error = null) {
@@ -2951,6 +3001,12 @@ async _doRefresh(forceRefresh = false) {
 
             const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
+            // 性能打点
+            const perfDebug = STREAM_PARSE_CONFIG.PERF_DEBUG;
+            const perfStart = perfDebug ? Date.now() : 0;
+            let perfFirstChunk = 0;
+            let perfFirstContent = 0;
+
             let stream = null;
             try {
                 const response = await this.axiosInstance.post(requestUrl, requestData, {
@@ -2964,9 +3020,16 @@ async _doRefresh(forceRefresh = false) {
                 let totalSize = 0;
                 let lastContentEvent = null;
                 const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
-                const CHUNK_BATCH_SIZE = 50;  // 每 50 个 chunk 合并一次
+                const CHUNK_BATCH_SIZE = STREAM_PARSE_CONFIG.BATCH_SIZE;
+                const MAX_PARSE_DELAY_MS = STREAM_PARSE_CONFIG.MAX_DELAY_MS;
+
+                // TTFB 优化：追踪是否已产出首个 content
+                let hasYieldedContent = false;
+                let lastParseTime = Date.now();
 
                 for await (const chunk of stream) {
+                    if (perfDebug && !perfFirstChunk) perfFirstChunk = Date.now();
+
                     const chunkStr = chunk.toString();
                     chunks.push(chunkStr);
                     totalSize += chunkStr.length;
@@ -2978,12 +3041,21 @@ async _doRefresh(forceRefresh = false) {
                         continue;
                     }
 
-                    // 定期合并缓冲区，避免数组过大
-                    if (chunks.length >= CHUNK_BATCH_SIZE) {
+                    const now = Date.now();
+                    const timeSinceLastParse = now - lastParseTime;
+
+                    // 解析触发条件：
+                    // 1. 首包快速通道：尚未产出 content 时，每个 chunk 都尝试解析
+                    // 2. 批处理模式：已产出 content 后，累积到 BATCH_SIZE 再解析
+                    // 3. 时间上界：超过 MAX_PARSE_DELAY_MS 强制解析
+                    const shouldParse = !hasYieldedContent ||
+                                        chunks.length >= CHUNK_BATCH_SIZE ||
+                                        timeSinceLastParse >= MAX_PARSE_DELAY_MS;
+
+                    if (shouldParse && chunks.length > 0) {
                         const buffer = chunks.join('');
                         const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
 
-                        // 重置 chunks 数组，保留剩余未处理的数据
                         chunks.length = 0;
                         if (remaining) {
                             chunks.push(remaining);
@@ -2991,13 +3063,19 @@ async _doRefresh(forceRefresh = false) {
                         } else {
                             totalSize = 0;
                         }
+                        lastParseTime = now;
 
                         for (const event of events) {
                             if (event.type === 'content' && event.data) {
-                                if (lastContentEvent === event.data) {
-                                    continue;
-                                }
+                                if (lastContentEvent === event.data) continue;
                                 lastContentEvent = event.data;
+                                if (!hasYieldedContent) {
+                                    hasYieldedContent = true;
+                                    if (perfDebug && !perfFirstContent) {
+                                        perfFirstContent = Date.now();
+                                        console.log(`[Kiro PERF] TTFB: request=${perfFirstChunk - perfStart}ms, parse=${perfFirstContent - perfFirstChunk}ms, total=${perfFirstContent - perfStart}ms`);
+                                    }
+                                }
                                 yield { type: 'content', content: event.data };
                             } else if (event.type === 'toolUse') {
                                 yield { type: 'toolUse', toolUse: event.data };
@@ -3064,8 +3142,28 @@ async _doRefresh(forceRefresh = false) {
 
                 // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
                 if (status === 403) {
-                    console.log('[Kiro] Received 403 in stream. Marking credential as unhealthy...');
-                    this._markCredentialUnhealthy('403 Forbidden', error);
+                    console.log('[Kiro] Received 403 in stream. Marking credential as need refresh...');
+
+                    // 检查是否为 temporarily suspended 错误
+                    const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+
+                    if (isSuspended) {
+                        // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                        console.log('[Kiro] Account temporarily suspended in stream. Marking as unhealthy without UUID refresh...');
+                        this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended', error);
+                    } else {
+                        // 其他 403 错误：先刷新 UUID，然后标记需要刷新
+                        const newUuid = this._refreshUuid();
+                        if (newUuid) {
+                            console.log(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+                            this.uuid = newUuid;
+                        }
+                        this._markCredentialNeedRefresh('403 Forbidden', error);
+                    }
+
+                    // Mark error for credential switch without recording error count
+                    error.shouldSwitchCredential = true;
+                    error.skipErrorCount = true;
                     throw error;
                 }
 
@@ -3999,7 +4097,6 @@ async _doRefresh(forceRefresh = false) {
             'user-agent': `aws-sdk-js/1.0.0 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-${kiroVersion}-${machineId}`,
             'amz-sdk-invocation-id': uuidv4(),
             'amz-sdk-request': 'attempt=1; max=1',
-            'Connection': 'close'
         };
 
         try {
@@ -4037,7 +4134,19 @@ async _doRefresh(forceRefresh = false) {
             
             if (status === 403) {
                 console.log('[Kiro] Received 403 on getUsageLimits. Marking credential as unhealthy (no retry)...');
-                this._markCredentialUnhealthy('403 Forbidden on usage query', formattedError);
+
+                // 检查是否为 temporarily suspended 错误
+                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+
+                if (isSuspended) {
+                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                    console.log('[Kiro] Account temporarily suspended on usage query. Marking as unhealthy without UUID refresh...');
+                    this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended on usage query', formattedError);
+                } else {
+                    // 其他 403 错误：标记需要刷新
+                    this._markCredentialNeedRefresh('403 Forbidden on usage query', formattedError);
+                }
+
                 throw formattedError;
             }
             

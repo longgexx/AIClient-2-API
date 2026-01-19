@@ -16,8 +16,8 @@
     "HEALTH_CHECK_INTERVAL": 120000,
     "stickySession": {
       "enabled": true,
-      "ttlMs": 1800000,
-      "cleanupIntervalMs": 300000,
+      "ttlMs": 300000,
+      "cleanupIntervalMs": 120000,
       "maxSessions": 10000
     },
     "providerFallbackChain": {
